@@ -132,6 +132,7 @@ def get_args_parser():
     parser.add_argument('--local_crops_scale', type=float, nargs='+', default=(0.05, 0.4),
         help="""Scale range of the cropped image before resizing, relatively to the origin image.
         Used for small local view cropping of multi-crop.""")
+    parser.add_argument('--clus_dim', default=2, type=int)
 
     # Misc
     parser.add_argument('--data_path', default='/path/to/imagenet/train/', type=str,
@@ -258,7 +259,14 @@ def train_dino(args):
         args.out_dim,
         use_bn=args.use_bn_in_head,
         norm_last_layer=args.norm_last_layer,
-    ))
+    ),
+         DINOHead(
+             embed_dim,
+             args.clus_dim,
+             use_bn=args.use_bn_in_head,
+             norm_last_layer=args.norm_last_layer,
+         )
+                                     )
     teacher = utils.MultiCropWrapper(
         teacher,
         DINOHead(embed_dim, args.out_dim, args.use_bn_in_head),
@@ -288,14 +296,16 @@ def train_dino(args):
         teacher = nn.SyncBatchNorm.convert_sync_batchnorm(teacher)
 
         # we need DDP wrapper to have synchro batch norms working...
-        teacher = nn.parallel.DistributedDataParallel(teacher, device_ids=[args.gpu])
+        teacher = nn.parallel.DistributedDataParallel(teacher, device_ids=[args.gpu], find_unused_parameters=True)
         teacher_without_ddp = teacher.module
     else:
         # teacher_without_ddp and teacher are the same thing
         teacher_without_ddp = teacher
-    student = nn.parallel.DistributedDataParallel(student, device_ids=[args.gpu])
+    student = nn.parallel.DistributedDataParallel(student, device_ids=[args.gpu], find_unused_parameters=True)
+
     # teacher and student start with the same weights
-    teacher_without_ddp.load_state_dict(student.module.state_dict())
+    # teacher_without_ddp.load_state_dict(student.module.state_dict())
+
     # there is no backpropagation through the teacher, so no need for gradients
     for p in teacher.parameters():
         p.requires_grad = False
@@ -413,9 +423,10 @@ def train_dino(args):
         if utils.is_main_process():
             with (Path(args.output_dir) / "log.txt").open("a") as f:
                 f.write(json.dumps(log_stats) + "\n")
-        _ = evaluate(test_known_loader, student, dino_loss, epoch, logger, "Val")
-        _ = evaluate(aux_test_loader, student, dino_loss, epoch, logger, "Aux")
-        _ = evaluate(test_unknown_loader, student, dino_loss, epoch, logger, "Unknown")
+        if epoch % 5 == 0:
+            _ = evaluate(test_known_loader, student, dino_loss, epoch, logger, "Val")
+            _ = evaluate(aux_test_loader, student, dino_loss, epoch, logger, "Aux")
+            _ = evaluate(test_unknown_loader, student, dino_loss, epoch, logger, "Unknown")
     total_time = time.time() - start_time
     total_time_str = str(datetime.timedelta(seconds=int(total_time)))
     print('Training time {}'.format(total_time_str))
@@ -446,7 +457,7 @@ def train_one_epoch(student, teacher, teacher_without_ddp, dino_loss, data_loade
         # teacher and student forward passes + compute dino loss
         with torch.cuda.amp.autocast(fp16_scaler is not None):
             teacher_output = teacher(images[:2])  # only the 2 global views pass through the teacher
-            student_output = student(images)
+            student_output = student(images, clus_fea=False)
             d_loss, ce_loss = dino_loss(student_output, teacher_output, label, epoch)
             logger.add_scalar('Train_Loss/dino_loss', d_loss, epoch * niters_per_epoch + idx)
             logger.add_scalar('Train_Loss/ce_loss', ce_loss, epoch * niters_per_epoch + idx)
@@ -520,18 +531,24 @@ def train_loss(student, teacher,teacher_without_ddp, dino_loss, data_loader, opt
         # teacher and student forward passes + compute dino loss
         with torch.cuda.amp.autocast(fp16_scaler is not None):
             teacher_output = teacher(images[:2])  # only the 2 global views pass through the teacher
-            student_output = student(images)
+            if use_clus:
+                student_output, student_output2 = student(images, clus_fea=True)
+            else:
+                student_output = student(images)
 
             d_loss, ce_loss = dino_loss(student_output, teacher_output, label, epoch)
             logger.add_scalar('Train_Loss/dino_loss', d_loss, epoch * niters_per_epoch + idx)
             loss = d_loss
             if use_clus:
-                fea = student.module.forward_features(images)
+                # fea = student.module.forward_features(images)
+                fea = student_output2
                 if aux_set:
                     targets_temp = torch.Tensor.cpu(label).detach().numpy() + args.num_train_classes
                 else:
                     targets_temp = torch.Tensor.cpu(label).detach().numpy()
                 targets_temp = np.tile(targets_temp.squeeze(),args.local_crops_number + 2).reshape(-1)
+                # print("target_temp:")
+                # print(targets_temp)
 
                 fea = fea.unsqueeze(1).repeat_interleave(args.num_train_classes + args.num_aux_classes, dim=1)
                 # print(fea.shape)
@@ -599,7 +616,7 @@ def train_one_epoch_clus(student, teacher, teacher_without_ddp, dino_loss, train
 
     train_loss(student, teacher, teacher_without_ddp, dino_loss, train_data_loader,
                     optimizer, lr_schedule, wd_schedule, momentum_schedule,epoch,
-                    fp16_scaler, args, logger, use_ce=True, use_clus=False, aux_set=False, metric_logger=metric_logger,
+                    fp16_scaler, args, logger, use_ce=False, use_clus=True, aux_set=False, metric_logger=metric_logger,
                     header=header, means=means)
 
     train_loader_len = len(train_data_loader)
@@ -627,7 +644,8 @@ def update_means(student, train_data_loader, aux_data_loader, args):
             images = [im.cuda(non_blocking=True) for im in images]
             label = label.cuda(non_blocking=True)
 
-            fea = student.module.forward_features(images)
+            # fea = student.module.forward_features(images)
+            _, fea = student(images, clus_fea=True)
             feas = torch.Tensor.cpu(fea).detach().numpy()
             if fea_list is None:
                 fea_list = feas
@@ -644,7 +662,8 @@ def update_means(student, train_data_loader, aux_data_loader, args):
             images = [im.cuda(non_blocking=True) for im in images]
             label = label.cuda(non_blocking=True)
 
-            fea = student.module.forward_features(images)
+            # fea = student.module.forward_features(images)
+            _, fea = student(images, clus_fea=True)
             feas = torch.Tensor.cpu(fea).detach().numpy()
             if fea_list is None:
                 fea_list = feas
