@@ -560,7 +560,7 @@ def train_loss(student, teacher,teacher_without_ddp, dino_loss, data_loader, opt
                     mask[id, index] = 1
                 # print(dist.shape)
                 # print(mask.shape)
-                clu_loss = torch.mean(torch.sum(torch.mul(dist, mask), dim=1)) / fea.shape[1]
+                clu_loss = torch.mean(torch.sum(torch.mul(dist, mask), dim=1)) / fea.shape[1] * 10
                 logger.add_scalar('Train_Loss/clu_loss', clu_loss, epoch * niters_per_epoch + idx)
                 loss += clu_loss
 
@@ -626,7 +626,7 @@ def train_one_epoch_clus(student, teacher, teacher_without_ddp, dino_loss, train
     #                 header=header, means=means, train_loader_len=train_loader_len)
     train_loss(student, teacher, teacher_without_ddp, dino_loss, aux_data_loader,
                optimizer, lr_schedule, wd_schedule, momentum_schedule, epoch,
-               fp16_scaler, args, logger, use_ce=True, use_clus=False, aux_set=True, metric_logger=metric_logger,
+               fp16_scaler, args, logger, use_ce=False, use_clus=True, aux_set=True, metric_logger=metric_logger,
                header=header, means=means, train_loader_len=train_loader_len)
 
     # means = update_means(student,train_data_loader,aux_data_loader,args)

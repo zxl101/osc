@@ -1,6 +1,6 @@
 #sh dist_train.sh configs/pvt/pvt_small.py 1 --data-path ./ --resume ./ --eval
 
-python -m torch.distributed.launch --nproc_per_node=1 --use_env main.py --config configs/backbones/vit_base.py --data-path ./ --dataset CUB --finetune ./mae_pretrain_vit_base.pth
+python -m torch.distributed.launch --nproc_per_node=1 --use_env main.py --config configs/backbones/vit_base.py --data-path ./ --dataset CUB --wclu 0 --lr 0.0001
 
 #python -m torch.distributed.launch --nproc_per_node=1 --use_env main.py --config configs/backbones/vit_base.py --data-path ./ --dataset SCAR
 

@@ -69,14 +69,72 @@ def cluster_acc(y_true, y_pred):
 #     return w, ind
     return sum([w[i, j] for i, j in ind]) * 1.0 / y_pred.size
 
+def update_means(model, train_data_loader, aux_data_loader=None, args=None):
+    fea_list = None
+    target_list = None
+    with torch.no_grad():
+        for it, (images, label) in enumerate(train_data_loader):
+            images = images.cuda(non_blocking=True)
+            label = label.cuda(non_blocking=True)
+
+            # fea = student.module.forward_features(images)
+            fea = model.module.forward_features(images)
+            feas = torch.Tensor.cpu(fea).detach().numpy()
+            if fea_list is None:
+                fea_list = feas
+            else:
+                fea_list = np.vstack((fea_list, feas))
+            targets_temp = torch.Tensor.cpu(label).detach().numpy()
+            if target_list is None:
+                target_list = targets_temp
+            else:
+                target_list = np.concatenate((target_list, targets_temp))
+
+        if aux_data_loader is not None:
+            for it, (images, label) in enumerate(aux_data_loader):
+                # move images to gpu
+                images = [im.cuda(non_blocking=True) for im in images]
+                label = label.cuda(non_blocking=True)
+
+                # fea = student.module.forward_features(images)
+                _, fea = student(images)
+                feas = torch.Tensor.cpu(fea).detach().numpy()
+                if fea_list is None:
+                    fea_list = feas
+                else:
+                    fea_list = np.vstack((fea_list, feas))
+                targets_temp = torch.Tensor.cpu(label).detach().numpy() + args.num_train_classes
+                if target_list is None:
+                    target_list = targets_temp
+                else:
+                    target_list = np.concatenate((target_list, targets_temp))
+
+    target_list = target_list.reshape(-1)
+    target_list = np.expand_dims(target_list, axis=1)
+    fea_tar = np.hstack((target_list, fea_list)).squeeze()
+    means_dict = {}
+    for i in np.unique(fea_tar[:, 0]):
+        tmp = fea_list[np.where(fea_tar[:, 0] == i)]
+        means_dict[i] = np.mean(tmp, axis=0)
+    # print(means[i].shape)
+    tmp_means = []
+    if aux_data_loader is not None:
+        for k in range(args.num_train_classes + args.num_aux_classes):
+            tmp_means.append(means_dict[k])
+    else:
+        for k in range(args.num_train_classes):
+            tmp_means.append(means_dict[k])
+    means = torch.as_tensor(np.array(tmp_means)).cuda()
+    print("The means are updated")
+    print("There are {} classes".format(means.shape[0]))
+    return means
 
 def train_one_epoch(model: torch.nn.Module, one_hot_layer, wce, wclu,
-                    criterion: DistillationLoss,
                     data_loader: Iterable, optimizer: torch.optim.Optimizer,
                     device: torch.device, epoch: int, loss_scaler, max_norm: float = 0,
                     model_ema: Optional[ModelEma] = None, mixup_fn: Optional[Mixup] = None,
                     set_training_mode=True,
-                    fp32=False, logger=None):
+                    fp32=False, logger=None, use_clus=False, aux_set=False, means=None, args=None):
     model.train(set_training_mode)
     metric_logger = utils.MetricLogger(delimiter="  ")
     metric_logger.add_meter('lr', utils.SmoothedValue(window_size=1, fmt='{value:.6f}'))
@@ -84,271 +142,48 @@ def train_one_epoch(model: torch.nn.Module, one_hot_layer, wce, wclu,
     print_freq = 10
 
     criterion1 = torch.nn.CrossEntropyLoss()
-    # criterion2 = SupCluLoss(temperature=0.07)
-    criterion2 = torch.nn.MSELoss(reduction='mean')
-    niters_per_epoch = len(data_loader)
-
-    idx = 0
-    for samples, targets in metric_logger.log_every(data_loader, print_freq, header):
-        idx += 1
-        samples = samples.to(device, non_blocking=True)
-        # print(samples.shape)
-        targets = targets.to(device, non_blocking=True)
-        # print(targets)
-        # if mixup_fn is not None:
-        #     samples, targets = mixup_fn(samples, targets)
-        # print(samples.shape)
-        # with torch.cuda.amp.autocast():
-        #     outputs = model(samples)
-        #     loss = critserion(samples, outputs, targets)
-        with torch.cuda.amp.autocast(enabled=not fp32):
-            # print(samples.shape)
-            outputs = model(samples)
-            # fea = model.module.forward_features(samples)
-
-            ce_loss = criterion1(outputs, targets)
-            # target_en = torch.nn.functional.one_hot(targets,100)
-            # print(target_en.type())
-            # target_en = target_en.to(torch.half)
-            # latent = one_hot_layer(target_en)
-            # print(fea.shape)
-            # print(latent.shape)
-            # l2_loss = criterion2(fea,latent)
-
-
-        ce_loss_value = ce_loss.item()
-        # clu_loss_value = clu_loss.item()
-
-        # loss = wce * ce_loss + wclu * l2_loss
-        loss = wce * ce_loss
-
-        if not math.isfinite(ce_loss_value):
-            print("Loss is {}, stopping training".format(ce_loss_value))
-            sys.exit(1)
-
-        optimizer.zero_grad()
-
-        # this attribute is added by timm on one optimizer (adahessian)
-        is_second_order = hasattr(optimizer, 'is_second_order') and optimizer.is_second_order
-        loss_scaler(loss, optimizer, clip_grad=max_norm,
-                    parameters=model.parameters(), create_graph=is_second_order)
-
-        torch.cuda.synchronize()
-        if model_ema is not None:
-            model_ema.update(model)
-
-        metric_logger.update(loss=ce_loss_value)
-        metric_logger.update(lr=optimizer.param_groups[0]["lr"])
-
-        logger.add_scalar('Train_Loss/ce_loss', ce_loss, epoch * niters_per_epoch + idx)
-        # logger.add_scalar('Train_Loss/l2_loss', l2_loss, epoch * niters_per_epoch + idx)
-
-    # gather the stats from all processes
-    metric_logger.synchronize_between_processes()
-
-    print("Averaged stats:", metric_logger)
-    return {k: meter.global_avg for k, meter in metric_logger.meters.items()}
-
-def train_one_epoch_byol(model: torch.nn.Module,
-                    data_loader: Iterable, optimizer: torch.optim.Optimizer,
-                    device: torch.device, epoch: int, loss_scaler, max_norm: float = 0,
-                    model_ema: Optional[ModelEma] = None, mixup_fn: Optional[Mixup] = None,
-                    set_training_mode=True,
-                    fp32=False, logger=None, use_momentum=True):
-    model.train(set_training_mode)
-    metric_logger = utils.MetricLogger(delimiter="  ")
-    metric_logger.add_meter('lr', utils.SmoothedValue(window_size=1, fmt='{value:.6f}'))
-    header = 'Epoch: [{}]'.format(epoch)
-    print_freq = 10
-
-    # criterion1 = torch.nn.CrossEntropyLoss()
-    # # criterion2 = SupCluLoss(temperature=0.07)
     # criterion2 = torch.nn.MSELoss(reduction='mean')
     niters_per_epoch = len(data_loader)
 
     idx = 0
-    for samples, targets in metric_logger.log_every(data_loader, print_freq, header):
+    for images, targets in metric_logger.log_every(data_loader, print_freq, header):
         idx += 1
-        samples = samples.to(device, non_blocking=True)
-        # print(samples.shape)
+        images = images.to(device, non_blocking=True)
         targets = targets.to(device, non_blocking=True)
-        # print(targets)
-        # if mixup_fn is not None:
-        #     samples, targets = mixup_fn(samples, targets)
-        # print(samples.shape)
-        # with torch.cuda.amp.autocast():
-        #     outputs = model(samples)
-        #     loss = critserion(samples, outputs, targets)
-        with torch.cuda.amp.autocast(enabled=not fp32):
-            # print(samples.shape)
-            loss = model(samples)
-            # fea = model.module.forward_features(samples)
-
-            # ce_loss = criterion1(outputs, targets)
-            # target_en = torch.nn.functional.one_hot(targets,100)
-            # print(target_en.type())
-            # target_en = target_en.to(torch.half)
-            # latent = one_hot_layer(target_en)
-            # print(fea.shape)
-            # print(latent.shape)
-            # l2_loss = criterion2(fea,latent)
-
-
-        # ce_loss_value = ce_loss.item()
-        # clu_loss_value = clu_loss.item()
-
-        # loss = wce * ce_loss + wclu * l2_loss
-        # loss = wce * ce_loss
-
-        if not math.isfinite(loss.item()):
-            print("Loss is {}, stopping training".format(loss.item()))
-            sys.exit(1)
-
-        optimizer.zero_grad()
-
-        # this attribute is added by timm on one optimizer (adahessian)
-        is_second_order = hasattr(optimizer, 'is_second_order') and optimizer.is_second_order
-        loss_scaler(loss, optimizer, clip_grad=max_norm,
-                    parameters=model.parameters(), create_graph=is_second_order)
-
-        torch.cuda.synchronize()
-        if model_ema is not None:
-            model_ema.update(model)
-
-        metric_logger.update(loss=loss)
-        metric_logger.update(lr=optimizer.param_groups[0]["lr"])
-        if use_momentum:
-            model.module.update_moving_average()
-        logger.add_scalar('Train_Loss/loss', loss, epoch * niters_per_epoch + idx)
-        # logger.add_scalar('Train_Loss/l2_loss', l2_loss, epoch * niters_per_epoch + idx)
-
-    # gather the stats from all processes
-    metric_logger.synchronize_between_processes()
-
-    print("Averaged stats:", metric_logger)
-    return {k: meter.global_avg for k, meter in metric_logger.meters.items()}
-
-def train_one_epoch_dgrl(model: torch.nn.Module, one_hot_layer, wce, wclu,
-                    criterion: DistillationLoss,
-                    data_loader: Iterable, optimizer: torch.optim.Optimizer,
-                    device: torch.device, epoch: int, loss_scaler, max_norm: float = 0,
-                    model_ema: Optional[ModelEma] = None, mixup_fn: Optional[Mixup] = None,
-                    set_training_mode=True,
-                    fp32=False, logger=None):
-    model.train(set_training_mode)
-    metric_logger = utils.MetricLogger(delimiter="  ")
-    metric_logger.add_meter('lr', utils.SmoothedValue(window_size=1, fmt='{value:.6f}'))
-    header = 'Epoch: [{}]'.format(epoch)
-    print_freq = 10
-
-    criterion1 = torch.nn.CrossEntropyLoss()
-    # criterion2 = SupCluLoss(temperature=0.07)
-    criterion2 = torch.nn.MSELoss(reduction='mean')
-    niters_per_epoch = len(data_loader)
-
-    idx = 0
-    class_label = torch.Tensor(np.array(range(100)))
-    for samples, targets in metric_logger.log_every(data_loader, print_freq, header):
-        idx += 1
-        samples = samples.to(device, non_blocking=True)
-        # print(samples.shape)
-        targets = targets.to(device, non_blocking=True)
-        center_labels_var = torch.autograd.Variable(class_label.to(torch.long)).cuda()
-        labels_var_one_hot = to_one_hot(targets, n_dims=100)
-        # print(targets)
-        # if mixup_fn is not None:
-        #     samples, targets = mixup_fn(samples, targets)
-        # print(samples.shape)
-        # with torch.cuda.amp.autocast():
-        #     outputs = model(samples)
-        #     loss = critserion(samples, outputs, targets)
-        with torch.cuda.amp.autocast(enabled=not fp32):
-            # print(samples.shape)
-            outputs = model(samples)
-            fea = model.module.forward(samples)
-            class_weight = model.module.head.weight
-            fea = fea - 4 * labels_var_one_hot.cuda()
-            ce_loss = criterion1(fea, targets)
-            center_loss = criterion1(torch.mm(class_weight, torch.t(class_weight)), center_labels_var)
-
-
-        ce_loss_value = ce_loss.item()
-        # clu_loss_value = clu_loss.item()
-
-        loss = ce_loss + 0.5 * center_loss
-
-        # if not math.isfinite(ce_loss_value):
-        #     print("Loss is {}, stopping training".format(ce_loss_value))
-        #     sys.exit(1)
-
-        optimizer.zero_grad()
-
-        # this attribute is added by timm on one optimizer (adahessian)
-        is_second_order = hasattr(optimizer, 'is_second_order') and optimizer.is_second_order
-        loss_scaler(loss, optimizer, clip_grad=max_norm,
-                    parameters=model.parameters(), create_graph=is_second_order)
-
-        torch.cuda.synchronize()
-        if model_ema is not None:
-            model_ema.update(model)
-
-        metric_logger.update(loss=ce_loss_value)
-        metric_logger.update(lr=optimizer.param_groups[0]["lr"])
-
-        logger.add_scalar('Train_Loss/ce_loss', ce_loss, epoch * niters_per_epoch + idx)
-        logger.add_scalar('Train_Loss/center_loss', center_loss, epoch * niters_per_epoch + idx)
-
-    # gather the stats from all processes
-    metric_logger.synchronize_between_processes()
-
-    print("Averaged stats:", metric_logger)
-    return {k: meter.global_avg for k, meter in metric_logger.meters.items()}
-
-def train_one_epoch_aux(model: torch.nn.Module, one_hot_layer, wce, wclu,
-                    criterion: DistillationLoss,
-                    train_data_loader: Iterable, aux_data_loader, optimizer: torch.optim.Optimizer,
-                    device: torch.device, epoch: int, loss_scaler, max_norm: float = 0,
-                    model_ema: Optional[ModelEma] = None, mixup_fn: Optional[Mixup] = None,
-                    set_training_mode=True,
-                    fp32=False, logger=None):
-    model.train(set_training_mode)
-    metric_logger = utils.MetricLogger(delimiter="  ")
-    metric_logger.add_meter('lr', utils.SmoothedValue(window_size=1, fmt='{value:.6f}'))
-    header = 'Epoch: [{}]'.format(epoch)
-    print_freq = 10
-
-    criterion1 = torch.nn.CrossEntropyLoss()
-    criterion2 = torch.nn.MSELoss(reduction='mean')
-    niters_per_epoch = len(train_data_loader)
-
-    idx = 0
-    for samples, targets in metric_logger.log_every(train_data_loader, print_freq, header):
-        idx += 1
-        samples = samples.to(device, non_blocking=True)
-        targets = targets.to(device, non_blocking=True)
-
-        # if mixup_fn is not None:
-        #     samples, targets = mixup_fn(samples, targets)
 
         with torch.cuda.amp.autocast(enabled=not fp32):
 
-            outputs = model(samples)
-            # fea = model.module.forward_features(samples)
-
+            outputs = model(images)
             ce_loss = criterion1(outputs, targets)
-            # target_en = torch.nn.functional.one_hot(targets,100)
-            # print(target_en.type())
-            # target_en = target_en.to(torch.half)
-            # latent = one_hot_layer(target_en)
-            # print(fea.shape)
-            # print(latent.shape)
-            # l2_loss = criterion2(fea,latent)
-
-
-        ce_loss_value = ce_loss.item()
-        # clu_loss_value = clu_loss.item()
 
         loss = wce * ce_loss
+
+        ce_loss_value = ce_loss.item()
+
+        if use_clus:
+            fea = model.module.forward_features(images)
+            if aux_set:
+                targets_temp = torch.Tensor.cpu(targets).detach().numpy() + args.num_train_classes
+            else:
+                targets_temp = torch.Tensor.cpu(targets).detach().numpy()
+            targets_temp = targets_temp.reshape(-1)
+
+            # fea = fea.unsqueeze(1).repeat_interleave(args.num_train_classes + args.num_aux_classes, dim=1)
+            fea = fea.unsqueeze(1).repeat_interleave(args.num_train_classes, dim=1)
+            # print(fea.shape)
+            # print(means.shape)
+            dist = torch.sqrt(torch.sum(torch.square(fea - means), dim=-1))
+            # print(dist.shape)
+            # mask = torch.full((fea.shape[0], args.num_train_classes + args.num_aux_classes), -1, dtype=int).cuda()
+            mask = torch.full((fea.shape[0], args.num_train_classes), -1, dtype=int).cuda()
+            # print(mask.shape)
+            for id, index in enumerate(targets_temp):
+                mask[id, index] = 1
+
+            clu_loss = torch.mean(torch.sum(torch.mul(dist, mask), dim=1)) / fea.shape[1] * 10
+            logger.add_scalar('Train_Loss/clu_loss', clu_loss, epoch * niters_per_epoch + idx)
+            loss += wclu * clu_loss
+
 
         if not math.isfinite(ce_loss_value):
             print("Loss is {}, stopping training".format(ce_loss_value))
@@ -370,58 +205,6 @@ def train_one_epoch_aux(model: torch.nn.Module, one_hot_layer, wce, wclu,
 
         logger.add_scalar('Train_Loss/ce_loss', ce_loss, epoch * niters_per_epoch + idx)
         # logger.add_scalar('Train_Loss/l2_loss', l2_loss, epoch * niters_per_epoch + idx)
-
-    niters_per_epoch = len(aux_data_loader)
-    for samples, targets in metric_logger.log_every(aux_data_loader, print_freq, header):
-        idx += 1
-        samples = samples.to(device, non_blocking=True)
-        targets = targets.to(device, non_blocking=True)
-
-        # if mixup_fn is not None:
-        #     samples, targets = mixup_fn(samples, targets)
-
-        with torch.cuda.amp.autocast(enabled=not fp32):
-
-            # outputs = model(samples)
-            fea = model.module.forward_features(samples)
-            # fea = model(samples)
-
-            # ce_loss = criterion1(outputs, targets)
-            target_en = torch.nn.functional.one_hot(targets,100)
-            # print(target_en.type())
-            target_en = target_en.to(torch.half)
-            latent = one_hot_layer(target_en)
-            # print(fea.shape)
-            # print(latent.shape)
-            l2_loss = criterion2(fea,latent)
-
-        # ce_loss_value = ce_loss.item()
-        # clu_loss_value = clu_loss.item()
-        l2_loss_value = l2_loss.item()
-
-        loss = wclu * l2_loss
-
-        if not math.isfinite(l2_loss_value):
-            print("Loss is {}, stopping training".format(ce_loss_value))
-            sys.exit(1)
-
-        optimizer.zero_grad()
-
-        # this attribute is added by timm on one optimizer (adahessian)
-        is_second_order = hasattr(optimizer, 'is_second_order') and optimizer.is_second_order
-        loss_scaler(loss, optimizer, clip_grad=max_norm,
-                    parameters=model.parameters(), create_graph=is_second_order)
-
-        torch.cuda.synchronize()
-        if model_ema is not None:
-            model_ema.update(model)
-
-        # metric_logger.update(loss=l2_loss_value)
-        # metric_logger.update(lr=optimizer.param_groups[0]["lr"])
-
-        # logger.add_scalar('Train_Loss/ce_loss', ce_loss, epoch * niters_per_epoch + idx)
-        logger.add_scalar('Train_Loss/l2_loss', l2_loss, epoch * niters_per_epoch + idx)
-
 
     # gather the stats from all processes
     metric_logger.synchronize_between_processes()
@@ -464,109 +247,19 @@ def concat_all_gather(tensor):
     output = torch.cat(tensors_gather, dim=0)
     return output
 
-def train_one_epoch_jigsaw(model: torch.nn.Module, criterion: DistillationLoss,
-                    data_loader: Iterable, optimizer: torch.optim.Optimizer,
-                    device: torch.device, epoch: int, loss_scaler, max_norm: float = 0,
-                    model_ema: Optional[ModelEma] = None, mixup_fn: Optional[Mixup] = None,
-                    set_training_mode=True,
-                    fp32=False,
-                    clu_fc = None,
-                    loc_fc = None):
-    model.train(set_training_mode)
-    metric_logger = utils.MetricLogger(delimiter="  ")
-    metric_logger.add_meter('lr', utils.SmoothedValue(window_size=1, fmt='{value:.6f}'))
-    header = 'Epoch: [{}]'.format(epoch)
-    print_freq = 10
-    criterion_clu = SupCluLoss(temperature=0.07)
-    criterion_loc = torch.nn.CrossEntropyLoss()
-    for samples, targets in metric_logger.log_every(data_loader, print_freq, header):
-        # samples = samples.to(device, non_blocking=True)
-        targets = targets.to(device, non_blocking=True)
-        # print(samples[0].shape)
-        for i in range(4):
-            samples[i] = samples[i].to(device, non_blocking=True)
-
-        images_gather, permute, bs_all = batch_gather_ddp(samples)
-        # print(len(images_gather))
-        # print(permute)
-        # print("Finished permutation!!!")
-        # if mixup_fn is not None:
-        #     samples, targets = mixup_fn(samples, targets)
-
-        # with torch.cuda.amp.autocast():
-        #     outputs = model(samples)
-        #     loss = criterion(samples, outputs, targets)
-        with torch.cuda.amp.autocast(enabled=not fp32):
-            fea = model.module.forward_features(images_gather)
-
-            # fea = fea.contiguous()
-            # print(fea.shape)
-            # q_gather = concat_all_gather(fea)
-            # # print(q_gather.shape)
-            # n, c, h, w = q_gather.shape
-            # c1, c2 = q_gather.split([1, 1], dim=2)
-            # f1, f2 = c1.split([1, 1], dim=3)
-            # f3, f4 = c2.split([1, 1], dim=3)
-            # q_gather = torch.cat([f1, f2, f3, f4], dim=0)
-            # q_gather = q_gather.view(n * 4, -1)
-            fea_len = fea.shape[1]
-            # print(fea.shape)
-            f1, f2, f3, f4 = fea.split([fea_len//4,fea_len//4,fea_len//4,fea_len//4],dim=1)
-            q_gather = torch.cat([f1, f2, f3, f4], dim=0)
-            # print(q_gather.shape)
-            # # clustering branch
-            label_clu = permute % bs_all
-            q_clu = clu_fc(q_gather)
-            q_clu = torch.nn.functional.normalize(q_clu, dim=1)
-            loss_clu = criterion_clu(q_clu, label_clu)
-
-            label_loc = torch.LongTensor([0] * bs_all + [1] * bs_all + [2] * bs_all + [3] * bs_all).cuda()
-            label_loc = label_loc[permute]
-            q_loc = loc_fc(q_gather)
-            loss_loc = criterion_loc(q_loc, label_loc)
-            # outputs = model(samples)
-            # loss = criterion(samples, outputs, targets)
-            loss = loss_clu + loss_loc
-
-        loss_value = loss.item()
-
-        if not math.isfinite(loss_value):
-            print("Loss is {}, stopping training".format(loss_value))
-            sys.exit(1)
-
-        optimizer.zero_grad()
-
-        # this attribute is added by timm on one optimizer (adahessian)
-        is_second_order = hasattr(optimizer, 'is_second_order') and optimizer.is_second_order
-        loss_scaler(loss, optimizer, clip_grad=max_norm,
-                    parameters=model.parameters(), create_graph=is_second_order)
-
-        torch.cuda.synchronize()
-        if model_ema is not None:
-            model_ema.update(model)
-
-        metric_logger.update(loss=loss_value)
-        metric_logger.update(lr=optimizer.param_groups[0]["lr"])
-    # gather the stats from all processes
-    metric_logger.synchronize_between_processes()
-    print("Averaged stats:", metric_logger)
-    return {k: meter.global_avg for k, meter in metric_logger.meters.items()}
-
 @torch.no_grad()
-def evaluate(data_loader, model, device, epoch, logger=None, name="Val", record=True):
-    criterion1 = torch.nn.CrossEntropyLoss()
-    criterion2 = SupCluLoss(temperature=0.07)
-    metric_logger = utils.MetricLogger(delimiter="  ")
-    header = 'Test:'
+def evaluate(known_data_loader, val_data_loader, aux_data_loader, unknown_data_loader, model, device, epoch, args, logger=None, means=None):
 
     # switch to evaluation mode
     model.eval()
+
+    criterion1 = torch.nn.CrossEntropyLoss()
     fea_list = None
     target_list = None
-    niters_per_epoch = len(data_loader)
-    idx = 0
-    for images, targets in metric_logger.log_every(data_loader, 10, header):
-        idx += 1
+
+    val_clu_loss = 0
+    val_ce_loss =0
+    for images, targets in val_data_loader:
         images = images.to(device, non_blocking=True)
         targets = targets.to(device, non_blocking=True)
 
@@ -574,15 +267,24 @@ def evaluate(data_loader, model, device, epoch, logger=None, name="Val", record=
         with torch.cuda.amp.autocast():
             outputs = model(images)
             fea = model.module.forward_features(images)
-            fea = model(images)
             ce_loss = criterion1(outputs, targets)
-            # clu_loss = criterion2(fea, targets)
-            # ce_loss = criterion1(samples, outputs, targets)
-            # clu_loss = criterion2(samples, outputs, targets)
-            # loss = criterion(output, target)
-        if record:
-            logger.add_scalar('{}/ce_loss'.format(name), ce_loss, epoch * niters_per_epoch + idx)
-        # logger.add_scalar('{}/clu_loss'.format(name), clu_loss, epoch * niters_per_epoch + idx)
+            val_ce_loss += ce_loss
+
+            targets_temp = torch.Tensor.cpu(targets).detach().numpy()
+            targets_temp = targets_temp.reshape(-1)
+
+            fea_mod = fea.unsqueeze(1).repeat_interleave(args.num_train_classes, dim=1)
+            # print(fea.shape)
+            # print(means.shape)
+            dist = torch.sqrt(torch.sum(torch.square(fea_mod - means), dim=-1))
+            # print(dist.shape)
+            mask = torch.full((fea.shape[0], args.num_train_classes), -1, dtype=int).cuda()
+            # print(mask.shape)
+            for id, index in enumerate(targets_temp):
+                mask[id, index] = 1
+
+            clu_loss = torch.mean(torch.sum(torch.mul(dist, mask), dim=1)) / fea.shape[1]
+            val_clu_loss += clu_loss
 
         feas = torch.Tensor.cpu(fea).detach().numpy()
         if fea_list is None:
@@ -594,40 +296,88 @@ def evaluate(data_loader, model, device, epoch, logger=None, name="Val", record=
             target_list = targets_temp
         else:
             target_list = np.concatenate((target_list, targets_temp))
+    # print(fea_list.shape)
+    kmeans = KMeans(n_clusters=args.num_train_classes, random_state=1).fit(fea_list)
+    val_cls_acc = cluster_acc(target_list, kmeans.labels_)
+    logger.add_scalar('Val/ce_loss', val_ce_loss, epoch)
+    logger.add_scalar('Val/clu_loss', val_clu_loss, epoch)
+    logger.add_scalar('{}/cls_acc'.format("Val"), val_cls_acc, epoch)
 
-        if name == "Val" and record:
-            acc1, acc5 = accuracy(outputs, targets, topk=(1, 5))
+    if epoch % 5 == 0:
+        fea_list = None
+        target_list = None
 
-            batch_size = images.shape[0]
-            metric_logger.update(loss=ce_loss.item())
-            metric_logger.meters['acc1'].update(acc1.item(), n=batch_size)
-            metric_logger.meters['acc5'].update(acc5.item(), n=batch_size)
+        for images, targets in known_data_loader:
+            images = images.to(device, non_blocking=True)
+            targets = targets.to(device, non_blocking=True)
 
+            # compute output
+            with torch.cuda.amp.autocast():
+                fea = model.module.forward_features(images)
 
-    kmeans = KMeans(n_clusters=len(set(target_list)), random_state=1).fit(fea_list)
-    # print(target_list.shape)
-    # print(len(kmeans.labels_))
-    # target_list = target_list.
-    cls_acc = cluster_acc(target_list, kmeans.labels_)
-    nmi = nmi_score(target_list, kmeans.labels_)
-    ari = ari_score(target_list, kmeans.labels_)
-    if record:
-        logger.add_scalar('{}/cls_acc'.format(name), cls_acc, epoch)
-        logger.add_scalar('{}/nmi_score'.format(name), nmi, epoch)
-        logger.add_scalar('{}/ari_score'.format(name), ari, epoch)
-        print("{} Clustering ACC: {}".format(name, cls_acc))
+            feas = torch.Tensor.cpu(fea).detach().numpy()
+            if fea_list is None:
+                fea_list = feas
+            else:
+                fea_list = np.vstack((fea_list,feas))
+            targets_temp = torch.Tensor.cpu(targets).detach().numpy()
+            if target_list is None:
+                target_list = targets_temp
+            else:
+                target_list = np.concatenate((target_list, targets_temp))
 
-    # gather the stats from all processes
-    if name == "Val" and record:
-        metric_logger.synchronize_between_processes()
-        print('* Acc@1 {top1.global_avg:.3f} Acc@5 {top5.global_avg:.3f} loss {losses.global_avg:.3f}'
-              .format(top1=metric_logger.acc1, top5=metric_logger.acc5, losses=metric_logger.loss))
+        for images, targets in aux_data_loader:
+            images = images.to(device, non_blocking=True)
+            targets = targets.to(device, non_blocking=True)
 
-        return {k: meter.global_avg for k, meter in metric_logger.meters.items()}
-    elif not record:
-        return cls_acc
-    else:
-        return None
+            # compute output
+            with torch.cuda.amp.autocast():
+                fea = model.module.forward_features(images)
+
+            feas = torch.Tensor.cpu(fea).detach().numpy()
+            fea_list = np.vstack((fea_list,feas))
+            targets_temp = torch.Tensor.cpu(targets).detach().numpy() + args.num_train_classes
+            target_list = np.concatenate((target_list, targets_temp))
+
+        known_set_len = target_list.shape[0]
+
+        for images, targets in unknown_data_loader:
+            images = images.to(device, non_blocking=True)
+            targets = targets.to(device, non_blocking=True)
+
+            # compute output
+            with torch.cuda.amp.autocast():
+                fea = model.module.forward_features(images)
+
+            feas = torch.Tensor.cpu(fea).detach().numpy()
+            fea_list = np.vstack((fea_list,feas))
+            targets_temp = torch.Tensor.cpu(targets).detach().numpy() + args.num_train_classes + args.num_aux_classes
+            target_list = np.concatenate((target_list, targets_temp))
+
+        kmeans = KMeans(n_clusters=args.num_train_classes, random_state=1).fit(fea_list[:known_set_len])
+        cls_acc = cluster_acc(target_list[:known_set_len], kmeans.labels_)
+        logger.add_scalar('{}/cls_acc'.format("Known"), cls_acc, epoch)
+        print("{} Clustering ACC: {}".format("Known", cls_acc))
+
+        kmeans = KMeans(n_clusters=args.num_aux_classes+args.num_test_classes, random_state=1).fit(fea_list[known_set_len:])
+        cls_acc = cluster_acc(target_list[known_set_len:], kmeans.labels_)
+        logger.add_scalar('{}/cls_acc'.format("Unknown"), cls_acc, epoch)
+        print("{} Clustering ACC: {}".format("Unknown", cls_acc))
+
+        kmeans = KMeans(n_clusters=args.num_train_classes+args.num_aux_classes+args.num_test_classes, random_state=1).fit(fea_list)
+        cls_acc = cluster_acc(target_list, kmeans.labels_)
+        logger.add_scalar('{}/cls_acc'.format("All"), cls_acc, epoch)
+        print("{} Clustering ACC: {}".format("All", cls_acc))
+
+        # with open(args.output_dir + "/fea.txt","wb") as f:
+        #     np.savetxt(f, fea_list, fmt='%f', delimiter=' ', newline='\r')
+        #     f.write(b'\n')
+        #
+        # with open(args.output_dir + "/target.txt","wb") as f:
+        #     np.savetxt(f, target_list, fmt='%f', delimiter=' ', newline='\r')
+        #     f.write(b'\n')
+
+    return args.wce * val_ce_loss + args.wclu * val_clu_loss
 
 @torch.no_grad()
 def evaluate_byol(data_loader, model, device, epoch, logger=None, name="Val", record=True):

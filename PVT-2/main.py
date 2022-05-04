@@ -32,7 +32,7 @@ from data.utils import TransformTwice, RandomTranslateWithReflect
 import torchvision.transforms as transforms
 from torch.utils.data import DataLoader
 from datasets import build_dataset
-from engine import train_one_epoch, train_one_epoch_aux, train_one_epoch_dgrl, evaluate
+from engine import train_one_epoch, update_means, evaluate
 from losses import DistillationLoss
 from samplers import RASampler
 # import models
@@ -51,6 +51,9 @@ def get_args_parser():
     parser.add_argument('--batch-size', default=8, type=int)
     parser.add_argument('--epochs', default=300, type=int)
     parser.add_argument('--config', required=True, type=str, help='config')
+    parser.add_argument('--num_train_classes', default=100, type=int)
+    parser.add_argument('--num_aux_classes', default=50, type=int)
+    parser.add_argument('--num_test_classes', default=50, type=int)
 
     # Model parameters
     parser.add_argument('--model', default='pvt_small', type=str, metavar='MODEL',
@@ -83,6 +86,7 @@ def get_args_parser():
                         help='weight decay (default: 0.05)')
     parser.add_argument('--wclu', type=float, default=1)
     parser.add_argument('--wce', type=float, default=1)
+
     # Learning rate schedule parameters
     parser.add_argument('--sched', default='cosine', type=str, metavar='SCHEDULER',
                         help='LR scheduler (default: "cosine"')
@@ -109,6 +113,7 @@ def get_args_parser():
                         help='patience epochs for Plateau LR scheduler (default: 10')
     parser.add_argument('--decay-rate', '--dr', type=float, default=0.1, metavar='RATE',
                         help='LR decay rate (default: 0.1)')
+    parser.add_argument('--ce_warmup_epoch', default=30, type=int)
 
     # Augmentation parameters
     parser.add_argument('--color-jitter', type=float, default=0.4, metavar='PCT',
@@ -228,7 +233,8 @@ def main(args):
     if args.dataset == 'CUB':
         args.nb_classes = 100
         args.input_size = 224
-        datasets = get_cub_datasets(train_transform, test_transform, seed=args.seed)
+        datasets = get_cub_datasets(train_transform, test_transform, seed=args.seed, num_train_classes=args.num_train_classes,
+                                    num_auxiliary_classes=args.num_aux_classes, num_open_set_classes=args.num_test_classes)
     elif args.dataset == 'SCAR':
         args.nb_classes = 98
         args.input_size = 224
@@ -248,15 +254,15 @@ def main(args):
         args.input_size = 64
         datasets = get_tiny_image_net_datasets(train_transform, test_transform, seed=args.seed)
 
-    mix_train_loader = DataLoader(datasets['mix_train'], batch_size=args.batch_size,
-                                  shuffle=True, sampler=None, num_workers=args.num_workers)
-    mix_test_loader = DataLoader(datasets['mix_test'], batch_size=args.batch_size,
-                                 shuffle=False, sampler=None, num_workers=args.num_workers)
+    # mix_train_loader = DataLoader(datasets['mix_train'], batch_size=args.batch_size,
+    #                               shuffle=True, sampler=None, num_workers=args.num_workers)
+    # mix_test_loader = DataLoader(datasets['mix_test'], batch_size=args.batch_size,
+    #                              shuffle=False, sampler=None, num_workers=args.num_workers)
     labeled_train_loader = DataLoader(datasets['train'], batch_size=args.batch_size,
                                       shuffle=True, sampler=None, num_workers=args.num_workers)
     labeled_eval_loader = DataLoader(datasets['val'], batch_size=args.batch_size,
                                      shuffle=False, sampler=None, num_workers=args.num_workers)
-    aux_test_loader = DataLoader(datasets['aux'], batch_size=args.batch_size,
+    aux_test_loader = DataLoader(datasets['aux_test'], batch_size=args.batch_size,
                                  shuffle=False, sampler=None, num_workers=args.num_workers)
     test_unknown_loader = DataLoader(datasets['test_unknown'], batch_size=args.batch_size,
                                      shuffle=False, sampler=None, num_workers=args.num_workers)
@@ -326,11 +332,11 @@ def main(args):
         #
         # for DINO
         # print(checkpoint_model.keys())
-        checkpoint_model = checkpoint_model['teacher']
-        for k in list(checkpoint_model.keys()):
-            if k.startswith("backbone."):
-                checkpoint_model[k.replace("backbone.","")] = checkpoint_model[k]
-                del checkpoint_model[k]
+        # checkpoint_model = checkpoint_model['teacher']
+        # for k in list(checkpoint_model.keys()):
+        #     if k.startswith("backbone."):
+        #         checkpoint_model[k.replace("backbone.","")] = checkpoint_model[k]
+        #         del checkpoint_model[k]
 
         # checkpoint_model = checkpoint_model['student']
         # for k in list(checkpoint_model.keys()):
@@ -342,11 +348,6 @@ def main(args):
         for k in list(checkpoint_model.keys()):
             if k in list(state_dict.keys()):
                 print(k)
-        # print("111111111111111111111111111111111111111111111")
-        # print(list(checkpoint_model.keys()))
-        # print("111111111111111111111111111111111111111111111")
-        # print(list(state_dict.keys()))
-        # print("111111111111111111111111111111111111111111111")
         model.load_state_dict(checkpoint_model, strict=False)
         print("Loading the pretrained model")
     model.to(device)
@@ -386,37 +387,6 @@ def main(args):
         # criterion = torch.nn.CrossEntropyLoss()
         criterion = SupCluLoss(temperature=0.07)
 
-    # teacher_model = None
-    # if args.distillation_type != 'none':
-    #     assert args.teacher_path, 'need to specify teacher-path when using distillation'
-    #     print(f"Creating teacher model: {args.teacher_model}")
-    #     teacher_model = create_model(
-    #         args.teacher_model,
-    #         pretrained=False,
-    #         num_classes=args.nb_classes,
-    #         global_pool='avg',
-    #     )
-    #     if args.teacher_path.startswith('https'):
-    #         checkpoint = torch.hub.load_state_dict_from_url(
-    #             args.teacher_path, map_location='cpu', check_hash=True)
-    #     else:
-    #         checkpoint = torch.load(args.teacher_path, map_location='cpu')
-    #     teacher_model.load_state_dict(checkpoint['model'])
-    #     teacher_model.to(device)
-    #     teacher_model.eval()
-
-    # wrap the criterion in our custom DistillationLoss, which
-    # just dispatches to the original criterion if args.distillation_type is 'none'
-    # criterion = DistillationLoss(
-    #     criterion, teacher_model, args.distillation_type, args.distillation_alpha, args.distillation_tau
-    # )
-    criterion = DistillationLoss(
-        criterion, None, 'none', 0, 0
-    )
-    # criterion2 = DistillationLoss(
-    #     criterion, None, 'none', 0, 0
-    # )
-
     output_dir = Path(args.output_dir)
     if args.resume:
         if args.resume.startswith('https'):
@@ -439,8 +409,7 @@ def main(args):
                 loss_scaler.load_state_dict(checkpoint['scaler'])
 
     if args.eval:
-        # test_stats = evaluate(data_loader_val, model, device)
-        # test_stats = evaluate(open_set_loader, model, device)
+
         model.eval()
         print("Start evaluation")
         open("{}/tk_result.txt".format(args.output_dir),"w").close()
@@ -449,10 +418,7 @@ def main(args):
         open("{}/tu_target.txt".format(args.output_dir), "w").close()
         open("{}/aux_result.txt".format(args.output_dir), "w").close()
         open("{}/aux_target.txt".format(args.output_dir), "w").close()
-        # for images, target in metric_logger.log_every(data_loader, 10, header):
-        # target_list = []
-        # output_list = []
-        # for batch_idx, (images, target) in enumerate(tqdm(open_set_loader)):
+
         for batch_idx, (images, target) in enumerate(tqdm(test_known_loader)):
             images = images.to(device, non_blocking=True)
             target = target.to(device, non_blocking=True)
@@ -495,19 +461,15 @@ def main(args):
             with open('{}/aux_target.txt'.format(args.output_dir), 'ab') as f:
                 np.savetxt(f, target, fmt='%f', delimiter=' ', newline='\r')
                 f.write(b'\n')
-        #     output_list.append(output)
-        #     target_list.append(target)
-        # with open('result.pkl','wb') as f:
-        #     pickle.dump(output_list,f,protocol=pickle.HIGHEST_PROTOCOL)
-        # with open('target.pkl','wb') as f:
-        #     pickle.dump(target_list,f,protocol=pickle.HIGHEST_PROTOCOL)
-        # print(f"Accuracy of the network on the {len(dataset_val)} test images: {test_stats['acc1']:.1f}%")
+
         return
 
     print(f"Start training for {args.epochs} epochs")
     start_time = time.time()
     max_accuracy = 0.0
+    best_val_loss = 99999999
 
+    means = update_means(model, data_loader_train, args=args)
     for epoch in range(args.start_epoch, args.epochs):
         if args.fp32_resume and epoch > args.start_epoch + 1:
             args.fp32_resume = False
@@ -517,60 +479,39 @@ def main(args):
         #     data_loader_train.sampler.set_epoch(epoch)
 
         train_stats = train_one_epoch(
-            model, one_hot_layer, args.wce, args.wclu,criterion, data_loader_train,
+            model, one_hot_layer, args.wce, args.wclu, data_loader_train,
             optimizer, device, epoch, loss_scaler,
             args.clip_grad, model_ema, mixup_fn,
             set_training_mode=args.finetune == '',  # keep in eval mode during finetuning
-            fp32=args.fp32_resume, logger=logger
+            fp32=args.fp32_resume, logger=logger, use_clus=True, aux_set=False, means=means, args=args
         )
 
-        # train_stats = train_one_epoch_aux(
-        #     model, one_hot_layer, args.wce, args.wclu, criterion, data_loader_train, aux_test_loader,
-        #     optimizer, device, epoch, loss_scaler,
-        #     args.clip_grad, model_ema, mixup_fn,
-        #     set_training_mode=args.finetune == '',  # keep in eval mode during finetuning
-        #     fp32=args.fp32_resume, logger=logger
-        # )
-
-        # train_stats = train_one_epoch_dgrl(
-        #     model, one_hot_layer, args.wce, args.wclu,criterion, data_loader_train,
-        #     optimizer, device, epoch, loss_scaler,
-        #     args.clip_grad, model_ema, mixup_fn,
-        #     set_training_mode=args.finetune == '',  # keep in eval mode during finetuning
-        #     fp32=args.fp32_resume, logger=logger
-        # )
-
         lr_scheduler.step(epoch)
-        if args.output_dir:
-            checkpoint_paths = [output_dir / 'checkpoint.pth']
-            for checkpoint_path in checkpoint_paths:
-                utils.save_on_master({
-                    'model': model_without_ddp.state_dict(),
-                    'optimizer': optimizer.state_dict(),
-                    'lr_scheduler': lr_scheduler.state_dict(),
-                    'epoch': epoch,
-                    # 'model_ema': get_state_dict(model_ema),
-                    'scaler': loss_scaler.state_dict(),
-                    'args': args,
-                }, checkpoint_path)
 
 
-        _ = evaluate(aux_test_loader, model, device, epoch, logger, name="Aux")
-        _ = evaluate(test_unknown_loader, model, device, epoch, logger, name="Unknown")
-        test_stats = evaluate(data_loader_val, model, device, epoch, logger)
-        # print(f"Accuracy of the network on the {len(dataset_val)} test images: {test_stats['acc1']:.1f}%")
-        print(f"Accuracy of the network on the test images: {test_stats['acc1']:.1f}%")
-        max_accuracy = max(max_accuracy, test_stats["acc1"])
-        print(f'Max accuracy: {max_accuracy:.2f}%')
+        means = update_means(model, data_loader_train, args=args)
 
-        log_stats = {**{f'train_{k}': v for k, v in train_stats.items()},
-                     **{f'test_{k}': v for k, v in test_stats.items()},
-                     'epoch': epoch,
-                     'n_parameters': n_parameters}
+        val_loss  = evaluate(test_known_loader, labeled_eval_loader, aux_test_loader, test_unknown_loader, model, device, epoch, args, logger, means)
+        if val_loss < best_val_loss:
+            best_val_loss = val_loss
+            if args.output_dir:
+                print("Save model weights of current epoch!")
+                checkpoint_paths = [output_dir / 'checkpoint.pth']
+                for checkpoint_path in checkpoint_paths:
+                    utils.save_on_master({
+                        'model': model_without_ddp.state_dict(),
+                        'optimizer': optimizer.state_dict(),
+                        'lr_scheduler': lr_scheduler.state_dict(),
+                        'epoch': epoch,
+                        # 'model_ema': get_state_dict(model_ema),
+                        'scaler': loss_scaler.state_dict(),
+                        'args': args,
+                    }, checkpoint_path)
 
-        if args.output_dir and utils.is_main_process():
-            with (output_dir / "log.txt").open("a") as f:
-                f.write(json.dumps(log_stats) + "\n")
+
+        # if args.output_dir and utils.is_main_process():
+        #     with (output_dir / "log.txt").open("a") as f:
+        #         f.write(json.dumps(log_stats) + "\n")
     total_time = time.time() - start_time
     total_time_str = str(datetime.timedelta(seconds=int(total_time)))
     print('Training time {}'.format(total_time_str))
