@@ -44,12 +44,15 @@ from vits import vit_small_single
 # from timm.models.vision_transformer import VisionTransformer, _cfg
 import pickle
 
+from dec import DEC
+from model_aevit import ae_vit_base_patch16_dec512d8b as ae_vit_base
+
 
 def get_args_parser():
     parser = argparse.ArgumentParser('PVT training and evaluation script', add_help=False)
     parser.add_argument('--fp32-resume', action='store_true', default=False)
     parser.add_argument('--batch-size', default=8, type=int)
-    parser.add_argument('--epochs', default=300, type=int)
+    parser.add_argument('--epochs', default=500, type=int)
     parser.add_argument('--config', required=True, type=str, help='config')
     parser.add_argument('--num_train_classes', default=100, type=int)
     parser.add_argument('--num_aux_classes', default=50, type=int)
@@ -113,7 +116,7 @@ def get_args_parser():
                         help='patience epochs for Plateau LR scheduler (default: 10')
     parser.add_argument('--decay-rate', '--dr', type=float, default=0.1, metavar='RATE',
                         help='LR decay rate (default: 0.1)')
-    parser.add_argument('--ce_warmup_epoch', default=30, type=int)
+    parser.add_argument('--ce_warmup_epoch', default=20, type=int)
 
     # Augmentation parameters
     parser.add_argument('--color-jitter', type=float, default=0.4, metavar='PCT',
@@ -271,10 +274,11 @@ def main(args):
     data_loader_train = labeled_train_loader
     data_loader_val = labeled_eval_loader
 
-
-
+    # print("1111111111111111111111111111111111111111111111")
+    # args.wclu = 1
+    # print(args.wclu)
     #Logger
-    args.output_dir = os.path.join(args.output_dir,args.dataset)
+    args.output_dir = os.path.join(args.output_dir,args.dataset, str(args.wce)+"_"+str(args.wclu)+"_"+datetime.datetime.now().strftime("%d_%m_%Y_%H_%M_%S"))
     logger = SummaryWriter(args.output_dir)
     log_format = '%(asctime)s %(message)s'
     logging.basicConfig(stream=sys.stdout, level=logging.INFO, format=log_format, datefmt='%m/%d %I:%M:%S %p')
@@ -294,15 +298,21 @@ def main(args):
 
     print(f"Creating model: {args.model}")
     # print(timm.list_models())
-    model = create_model(
-        args.model,
-        # pretrained=False,
-        pretrained=True,
-        num_classes=args.nb_classes,
-        drop_rate=args.drop,
-        drop_path_rate=args.drop_path,
-        drop_block_rate=None,
-    )
+    # model = create_model(
+    #     args.model,
+    #     pretrained=False,
+    #     # pretrained=True,
+    #     num_classes=args.nb_classes,
+    #     drop_rate=args.drop,
+    #     drop_path_rate=args.drop_path,
+    #     drop_block_rate=None,
+    # )
+
+    # model = DEC(args.num_train_classes, 768, model, 1.0)
+
+    model = ae_vit_base()
+    # model.load_pretrained(
+    #     "B_16-i21k-300ep-lr_0.001-aug_medium1-wd_0.1-do_0.0-sd_0.0--imagenet2012-steps_20k-lr_0.01-res_224.npz")
 
     # utils.save_on_master(model.state_dict(), "./imagenet_pretrained.pth")
     # print("Imagenet supervised pretrained weights saved!")
@@ -320,10 +330,11 @@ def main(args):
         else:
             checkpoint_model = checkpoint
         state_dict = model.state_dict()
-        for k in ['head.weight', 'head.bias', 'head_dist.weight', 'head_dist.bias']:
-            if k in checkpoint_model and checkpoint_model[k].shape != state_dict[k].shape:
-                print(f"Removing key {k} from pretrained checkpoint")
-                del checkpoint_model[k]
+        # for k in ['head.weight', 'head.bias', 'head_dist.weight', 'head_dist.bias']:
+        #     if k in checkpoint_model and checkpoint_model[k].shape != state_dict[k].shape:
+        #         print(f"Removing key {k} from pretrained checkpoint")
+        #         del checkpoint_model[k]
+
         # for BYOL and SimSiam
         # for k in list(checkpoint_model.keys()):
         #     if k.startswith("net."):
@@ -349,10 +360,16 @@ def main(args):
             if k in list(state_dict.keys()):
                 print(k)
         model.load_state_dict(checkpoint_model, strict=False)
+
+        print("Following variables are not in the pretrained weights")
+        for k in list(state_dict.keys()):
+            if k not in list(checkpoint_model.keys()):
+                print(k)
+
         print("Loading the pretrained model")
     model.to(device)
-    one_hot_layer = torch.nn.Linear(100, 768)
-    one_hot_layer = one_hot_layer.cuda()
+    # one_hot_layer = torch.nn.Linear(100, 768)
+    # one_hot_layer = one_hot_layer.cuda()
 
     model_ema = None
     # if args.model_ema:
@@ -365,7 +382,8 @@ def main(args):
 
     model_without_ddp = model
     if args.distributed:
-        model = torch.nn.parallel.DistributedDataParallel(model, device_ids=[args.gpu])
+        model = torch.nn.parallel.DistributedDataParallel(model, device_ids=[args.gpu], find_unused_parameters=True)
+        # model = torch.nn.parallel.DistributedDataParallel(model, device_ids=[args.gpu])
         model_without_ddp = model.module
     n_parameters = sum(p.numel() for p in model.parameters() if p.requires_grad)
     print('number of params:', n_parameters)
@@ -469,7 +487,9 @@ def main(args):
     max_accuracy = 0.0
     best_val_loss = 99999999
 
-    means = update_means(model, data_loader_train, args=args)
+    means = update_means(model, data_loader_train, args=args, logger=logger, epoch=-1)
+    evaluate(test_known_loader, labeled_eval_loader, aux_test_loader, test_unknown_loader, model, device, -1, args,
+             logger, means)
     for epoch in range(args.start_epoch, args.epochs):
         if args.fp32_resume and epoch > args.start_epoch + 1:
             args.fp32_resume = False
@@ -477,19 +497,28 @@ def main(args):
 
         # if args.distributed:
         #     data_loader_train.sampler.set_epoch(epoch)
-
-        train_stats = train_one_epoch(
-            model, one_hot_layer, args.wce, args.wclu, data_loader_train,
-            optimizer, device, epoch, loss_scaler,
-            args.clip_grad, model_ema, mixup_fn,
-            set_training_mode=args.finetune == '',  # keep in eval mode during finetuning
-            fp32=args.fp32_resume, logger=logger, use_clus=True, aux_set=False, means=means, args=args
-        )
+        if epoch < args.ce_warmup_epoch:
+            train_stats = train_one_epoch(
+                model, args.wce, args.wclu, data_loader_train,
+                optimizer, device, epoch, loss_scaler,
+                args.clip_grad, model_ema, mixup_fn,
+                set_training_mode=args.finetune == '',  # keep in eval mode during finetuning
+                fp32=args.fp32_resume, logger=logger, use_clus=False, aux_set=False, means=means, args=args
+            )
+        else:
+            args.wce = 0
+            train_stats = train_one_epoch(
+                model, args.wce, args.wclu, data_loader_train,
+                optimizer, device, epoch, loss_scaler,
+                args.clip_grad, model_ema, mixup_fn,
+                set_training_mode=args.finetune == '',  # keep in eval mode during finetuning
+                fp32=args.fp32_resume, logger=logger, use_clus=True, aux_set=False, means=means, args=args
+            )
 
         lr_scheduler.step(epoch)
 
 
-        means = update_means(model, data_loader_train, args=args)
+        means = update_means(model, data_loader_train, args=args, logger=logger, epoch=epoch)
 
         val_loss  = evaluate(test_known_loader, labeled_eval_loader, aux_test_loader, test_unknown_loader, model, device, epoch, args, logger, means)
         if val_loss < best_val_loss:
@@ -520,8 +549,10 @@ def main(args):
 if __name__ == '__main__':
     parser = argparse.ArgumentParser('DeiT training and evaluation script', parents=[get_args_parser()])
     args = parser.parse_args()
+    # print(args)
     args = utils.update_from_config(args)
-    args.lr = 0.0005
+    # print(args)
+    # args.lr = 0.0005
     if args.output_dir:
         Path(args.output_dir).mkdir(parents=True, exist_ok=True)
     main(args)

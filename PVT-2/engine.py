@@ -6,8 +6,11 @@ Train and eval functions used in main.py
 import math
 import sys
 from typing import Iterable, Optional
+import matplotlib.pyplot as plt
+import matplotlib
 
 import torch
+from torchvision.utils import make_grid
 import numpy as np
 
 from timm.data import Mixup
@@ -21,7 +24,12 @@ from sklearn.cluster import KMeans, DBSCAN, AgglomerativeClustering
 from sklearn.metrics.cluster import normalized_mutual_info_score as nmi_score
 from sklearn.metrics import adjusted_rand_score as ari_score
 from sklearn.utils.linear_assignment_ import linear_assignment
+from sklearn.manifold import TSNE
+from scipy.spatial import distance_matrix
+import seaborn as sns
 # from scipy.optimize import linear_sum_assignment as linear_assignment
+
+from dec import target_distribution
 
 def to_one_hot(y, n_dims=None):
     """ Take integer y (tensor or variable) with n dims and convert it to 1-hot representation with n+1 dims. """
@@ -69,7 +77,7 @@ def cluster_acc(y_true, y_pred):
 #     return w, ind
     return sum([w[i, j] for i, j in ind]) * 1.0 / y_pred.size
 
-def update_means(model, train_data_loader, aux_data_loader=None, args=None):
+def update_means(model, train_data_loader, aux_data_loader=None, args=None, logger=None, epoch=None):
     fea_list = None
     target_list = None
     with torch.no_grad():
@@ -78,8 +86,12 @@ def update_means(model, train_data_loader, aux_data_loader=None, args=None):
             label = label.cuda(non_blocking=True)
 
             # fea = student.module.forward_features(images)
-            fea = model.module.forward_features(images)
+            # fea = model.module.forward_features(images)
+            # fea = model.module.encoder.forward_features(images)
+            _, _, fea, _ = model(images)
+            # fea = torch.nn.functional.normalize(fea, p=2)
             feas = torch.Tensor.cpu(fea).detach().numpy()
+            # print(feas.shape)
             if fea_list is None:
                 fea_list = feas
             else:
@@ -97,7 +109,7 @@ def update_means(model, train_data_loader, aux_data_loader=None, args=None):
                 label = label.cuda(non_blocking=True)
 
                 # fea = student.module.forward_features(images)
-                _, fea = student(images)
+                _, fea = model(images)
                 feas = torch.Tensor.cpu(fea).detach().numpy()
                 if fea_list is None:
                     fea_list = feas
@@ -110,13 +122,15 @@ def update_means(model, train_data_loader, aux_data_loader=None, args=None):
                     target_list = np.concatenate((target_list, targets_temp))
 
     target_list = target_list.reshape(-1)
+    # print(set(target_list))
     target_list = np.expand_dims(target_list, axis=1)
+    # print(target_list.shape)
+    # print(fea_list.shape)
     fea_tar = np.hstack((target_list, fea_list)).squeeze()
     means_dict = {}
     for i in np.unique(fea_tar[:, 0]):
         tmp = fea_list[np.where(fea_tar[:, 0] == i)]
         means_dict[i] = np.mean(tmp, axis=0)
-    # print(means[i].shape)
     tmp_means = []
     if aux_data_loader is not None:
         for k in range(args.num_train_classes + args.num_aux_classes):
@@ -125,11 +139,21 @@ def update_means(model, train_data_loader, aux_data_loader=None, args=None):
         for k in range(args.num_train_classes):
             tmp_means.append(means_dict[k])
     means = torch.as_tensor(np.array(tmp_means)).cuda()
+    # print(means)
     print("The means are updated")
     print("There are {} classes".format(means.shape[0]))
+    dm = distance_matrix(np.array(tmp_means), np.array(tmp_means))
+    # fig = plt.figure()
+    # plt.imshow(dm, cmap='hot', interpolation='nearest')
+    # logger.add_figure("distance_heatmap", fig, epoch)
+
+    ax = sns.heatmap(dm, linewidth=0, cmap='coolwarm')
+    fig = ax.get_figure()
+    logger.add_figure("distance_heatmap", fig, epoch)
+
     return means
 
-def train_one_epoch(model: torch.nn.Module, one_hot_layer, wce, wclu,
+def train_one_epoch(model: torch.nn.Module, wce, wclu,
                     data_loader: Iterable, optimizer: torch.optim.Optimizer,
                     device: torch.device, epoch: int, loss_scaler, max_norm: float = 0,
                     model_ema: Optional[ModelEma] = None, mixup_fn: Optional[Mixup] = None,
@@ -143,7 +167,10 @@ def train_one_epoch(model: torch.nn.Module, one_hot_layer, wce, wclu,
 
     criterion1 = torch.nn.CrossEntropyLoss()
     # criterion2 = torch.nn.MSELoss(reduction='mean')
+    loss_function = torch.nn.KLDivLoss(reduction='sum')
     niters_per_epoch = len(data_loader)
+
+    means = torch.diag(torch.Tensor([10 for i in range(args.num_train_classes)])).cuda()
 
     idx = 0
     for images, targets in metric_logger.log_every(data_loader, print_freq, header):
@@ -153,15 +180,20 @@ def train_one_epoch(model: torch.nn.Module, one_hot_layer, wce, wclu,
 
         with torch.cuda.amp.autocast(enabled=not fp32):
 
-            outputs = model(images)
-            ce_loss = criterion1(outputs, targets)
+            re_loss, pred, latent, rec = model(images)
+            ce_loss = criterion1(pred, targets)
 
-        loss = wce * ce_loss
-
+        loss = wce * ce_loss + re_loss
+        # print(ce_loss)
+        # print("1111111")
+        # print(re_loss)
         ce_loss_value = ce_loss.item()
 
         if use_clus:
-            fea = model.module.forward_features(images)
+            # fea = model.module.forward_features(images)
+            # fea = model.module.encoder.forward_features(images)
+            # fea = torch.nn.functional.normalize(fea, p=2)
+            fea = pred
             if aux_set:
                 targets_temp = torch.Tensor.cpu(targets).detach().numpy() + args.num_train_classes
             else:
@@ -169,20 +201,52 @@ def train_one_epoch(model: torch.nn.Module, one_hot_layer, wce, wclu,
             targets_temp = targets_temp.reshape(-1)
 
             # fea = fea.unsqueeze(1).repeat_interleave(args.num_train_classes + args.num_aux_classes, dim=1)
-            fea = fea.unsqueeze(1).repeat_interleave(args.num_train_classes, dim=1)
-            # print(fea.shape)
-            # print(means.shape)
-            dist = torch.sqrt(torch.sum(torch.square(fea - means), dim=-1))
-            # print(dist.shape)
-            # mask = torch.full((fea.shape[0], args.num_train_classes + args.num_aux_classes), -1, dtype=int).cuda()
-            mask = torch.full((fea.shape[0], args.num_train_classes), -1, dtype=int).cuda()
-            # print(mask.shape)
-            for id, index in enumerate(targets_temp):
-                mask[id, index] = 1
+            # fea = fea.unsqueeze(1).repeat_interleave(args.num_train_classes, dim=1)
+            #
+            # dist = torch.sqrt(torch.sum(torch.square(fea - means), dim=-1))
+            # # mask = torch.full((fea.shape[0], args.num_train_classes + args.num_aux_classes), -1, dtype=int).cuda()
+            # pos_mask = torch.full((fea.shape[0], args.num_train_classes), 0, dtype=int).cuda()
+            # neg_mask = torch.full((fea.shape[0], args.num_train_classes), 1, dtype=int).cuda()
+            # for id, index in enumerate(targets_temp):
+            #     # mask[id, index] = args.num_train_classes
+            #     pos_mask[id, index] = 1
+            #     neg_mask[id, index] = 1
+            #
+            # clu_loss = torch.mean(torch.sum(torch.mul(dist, pos_mask), dim=1)) + torch.mean(
+            #     torch.sum(torch.mul(1 / dist, pos_mask), dim=1))
+            # print(mask)
+            #
+            # # DCN loss
+            # clu_loss = torch.tensor(0.).cuda()
+            # for i in range(args.batch_size):
+            #     diff_vec = fea[i] - means[targets_temp[i]]
+            #     sample_dist_loss = torch.matmul(diff_vec.view(1,-1),
+            #                                     diff_vec.view(-1,1))
+            #     clu_loss += 0.5 * torch.squeeze(sample_dist_loss)
 
-            clu_loss = torch.mean(torch.sum(torch.mul(dist, mask), dim=1)) / fea.shape[1] * 10
-            logger.add_scalar('Train_Loss/clu_loss', clu_loss, epoch * niters_per_epoch + idx)
-            loss += wclu * clu_loss
+            # CAC loss
+            # distance matrix from feature to class anchors
+            fea = fea.unsqueeze(1).expand(-1, args.num_train_classes, -1)
+            anchors = means.unsqueeze(0).expand(fea.shape[0],-1,-1)
+            dist = torch.norm(fea - anchors, 2, 2)
+            true = torch.gather(dist, 1, targets.view(-1,1)).view(-1)
+            non_gt = torch.Tensor([[i for i in range(args.num_train_classes) if targets[x] !=i] for x in range(len(dist))]).long().cuda()
+            others = torch.gather(dist, 1, non_gt)
+            anchor = torch.mean(true)
+            tuplet = torch.exp(-others+true.unsqueeze(1))
+            tuplet = torch.mean(torch.log(1+torch.sum(tuplet, dim=1)))
+
+            logger.add_scalar('Train_Loss/anchor_loss', anchor, epoch * niters_per_epoch + idx)
+            logger.add_scalar('Train_Loss/tuplet_loss', tuplet, epoch * niters_per_epoch + idx)
+            loss += 0.1 * anchor + tuplet
+
+            # DEC loss
+            # target_p = target_distribution(fea)
+            # clu_loss = loss_function(fea.log(), target_p) / fea.shape[0]
+
+
+            # logger.add_scalar('Train_Loss/clu_loss', clu_loss, epoch * niters_per_epoch + idx)
+            # loss += wclu * clu_loss
 
 
         if not math.isfinite(ce_loss_value):
@@ -204,6 +268,13 @@ def train_one_epoch(model: torch.nn.Module, one_hot_layer, wce, wclu,
         metric_logger.update(lr=optimizer.param_groups[0]["lr"])
 
         logger.add_scalar('Train_Loss/ce_loss', ce_loss, epoch * niters_per_epoch + idx)
+        logger.add_scalar('Train_Loss/re_loss', re_loss, epoch * niters_per_epoch + idx)
+        if idx == 5:
+            # print(rec.shape)
+            img_grid = make_grid(rec, nrow=4)
+            logger.add_image('Train/reconstructed', img_grid,epoch)
+            img_grid = make_grid(images, nrow=4)
+            logger.add_image('Train/original', img_grid, epoch)
         # logger.add_scalar('Train_Loss/l2_loss', l2_loss, epoch * niters_per_epoch + idx)
 
     # gather the stats from all processes
@@ -256,34 +327,55 @@ def evaluate(known_data_loader, val_data_loader, aux_data_loader, unknown_data_l
     criterion1 = torch.nn.CrossEntropyLoss()
     fea_list = None
     target_list = None
+    # means = torch.from_numpy(means)
 
     val_clu_loss = 0
-    val_ce_loss =0
+    val_ce_loss = 0
+    val_re_loss = 0
+    # loss_function = torch.nn.KLDivLoss(reduction='sum')
     for images, targets in val_data_loader:
         images = images.to(device, non_blocking=True)
         targets = targets.to(device, non_blocking=True)
 
         # compute output
         with torch.cuda.amp.autocast():
-            outputs = model(images)
-            fea = model.module.forward_features(images)
-            ce_loss = criterion1(outputs, targets)
+            # outputs = model(images)
+            re_loss, pred, fea, rec = model(images)
+            # fea = model.module.forward_features(images)
+            # fea = model.module.encoder.forward_features(images)
+            # fea = torch.nn.functional.normalize(fea, p=2)
+            ce_loss = criterion1(pred, targets)
+            val_re_loss += re_loss
             val_ce_loss += ce_loss
 
             targets_temp = torch.Tensor.cpu(targets).detach().numpy()
             targets_temp = targets_temp.reshape(-1)
 
-            fea_mod = fea.unsqueeze(1).repeat_interleave(args.num_train_classes, dim=1)
-            # print(fea.shape)
-            # print(means.shape)
-            dist = torch.sqrt(torch.sum(torch.square(fea_mod - means), dim=-1))
-            # print(dist.shape)
-            mask = torch.full((fea.shape[0], args.num_train_classes), -1, dtype=int).cuda()
-            # print(mask.shape)
-            for id, index in enumerate(targets_temp):
-                mask[id, index] = 1
+            # target_p = target_distribution(fea)
+            # clu_loss = loss_function(fea.log(), target_p) / fea.shape[0]
 
-            clu_loss = torch.mean(torch.sum(torch.mul(dist, mask), dim=1)) / fea.shape[1]
+            clu_loss = torch.tensor(0.).cuda()
+            for i in range(fea.shape[0]):
+                diff_vec = fea[i] - means[targets_temp[i]]
+                sample_dist_loss = torch.matmul(diff_vec.view(1, -1),
+                                                diff_vec.view(-1, 1))
+                clu_loss += 0.5 * torch.squeeze(sample_dist_loss)
+
+            # fea_mod = fea.unsqueeze(1).repeat_interleave(args.num_train_classes, dim=1)
+            # # print(fea.shape)
+            # # print(means.shape)
+            # dist = torch.sqrt(torch.sum(torch.square(fea_mod - means), dim=-1))
+            # # dist = torch.nn.functional.normalize(dist)
+            # # print(dist.shape)
+            # pos_mask = torch.full((fea.shape[0], args.num_train_classes), 0, dtype=int).cuda()
+            # neg_mask = torch.full((fea.shape[0], args.num_train_classes), 1, dtype=int).cuda()
+            # for id, index in enumerate(targets_temp):
+            #     # mask[id, index] = args.num_train_classes
+            #     pos_mask[id, index] = 1
+            #     neg_mask[id, index] = 1
+            #
+            # clu_loss = torch.mean(torch.sum(torch.mul(dist, pos_mask), dim=1)) + torch.mean(
+            #     torch.sum(torch.mul(1 / dist, pos_mask), dim=1))
             val_clu_loss += clu_loss
 
         feas = torch.Tensor.cpu(fea).detach().numpy()
@@ -300,6 +392,7 @@ def evaluate(known_data_loader, val_data_loader, aux_data_loader, unknown_data_l
     kmeans = KMeans(n_clusters=args.num_train_classes, random_state=1).fit(fea_list)
     val_cls_acc = cluster_acc(target_list, kmeans.labels_)
     logger.add_scalar('Val/ce_loss', val_ce_loss, epoch)
+    logger.add_scalar('Val/re_loss', val_re_loss, epoch)
     logger.add_scalar('Val/clu_loss', val_clu_loss, epoch)
     logger.add_scalar('{}/cls_acc'.format("Val"), val_cls_acc, epoch)
 
@@ -313,7 +406,10 @@ def evaluate(known_data_loader, val_data_loader, aux_data_loader, unknown_data_l
 
             # compute output
             with torch.cuda.amp.autocast():
-                fea = model.module.forward_features(images)
+                # fea = model.module.forward_features(images)
+                re_loss, pred, fea, rec = model(images)
+                # fea = model.module.encoder.forward_features(images)
+                # fea = torch.nn.functional.normalize(fea, p=2)
 
             feas = torch.Tensor.cpu(fea).detach().numpy()
             if fea_list is None:
@@ -332,7 +428,10 @@ def evaluate(known_data_loader, val_data_loader, aux_data_loader, unknown_data_l
 
             # compute output
             with torch.cuda.amp.autocast():
-                fea = model.module.forward_features(images)
+                # fea = model.module.forward_features(images)
+                re_loss, pred, fea, rec = model(images)
+                # fea = model.module.encoder.forward_features(images)
+                # fea = torch.nn.functional.normalize(fea, p=2)
 
             feas = torch.Tensor.cpu(fea).detach().numpy()
             fea_list = np.vstack((fea_list,feas))
@@ -347,7 +446,10 @@ def evaluate(known_data_loader, val_data_loader, aux_data_loader, unknown_data_l
 
             # compute output
             with torch.cuda.amp.autocast():
-                fea = model.module.forward_features(images)
+                # fea = model.module.forward_features(images)
+                re_loss, pred, fea, rec = model(images)
+                # fea = model.module.encoder.forward_features(images)
+                # fea = torch.nn.functional.normalize(fea, p=2)
 
             feas = torch.Tensor.cpu(fea).detach().numpy()
             fea_list = np.vstack((fea_list,feas))
@@ -369,6 +471,30 @@ def evaluate(known_data_loader, val_data_loader, aux_data_loader, unknown_data_l
         logger.add_scalar('{}/cls_acc'.format("All"), cls_acc, epoch)
         print("{} Clustering ACC: {}".format("All", cls_acc))
 
+        tsne = TSNE(n_components=2)
+        twodim_fea = tsne.fit_transform(fea_list)
+        kmeans = KMeans(n_clusters=args.num_train_classes + args.num_aux_classes + args.num_test_classes,
+                        random_state=1).fit(twodim_fea)
+        cls_acc = cluster_acc(target_list, kmeans.labels_)
+        logger.add_scalar('{}/tsne_cls_acc'.format("All"), cls_acc, epoch)
+        print("{} TSNE Clustering ACC: {}".format("All", cls_acc))
+
+        colors = matplotlib.cm.rainbow(np.linspace(0, 1, args.num_train_classes + args.num_aux_classes + args.num_test_classes))
+        color_list = [colors[i] for i in target_list.tolist()]
+        fig = plt.figure()
+        plt.scatter(twodim_fea[:, 0].tolist(), twodim_fea[:, 1].tolist(), s=2, c=color_list)
+        logger.add_figure("fea_vis", fig, epoch)
+
+        tsne = TSNE(n_components=2)
+        twodim_fea = tsne.fit_transform(torch.Tensor.cpu(means).detach().numpy())
+        colors = matplotlib.cm.rainbow(
+            np.linspace(0, 1, args.num_train_classes))
+        color_list = colors
+        fig = plt.figure()
+        plt.scatter(twodim_fea[:, 0].tolist(), twodim_fea[:, 1].tolist(), s=2, c=color_list)
+        for i in range(args.num_train_classes):
+            plt.annotate(str(i), (twodim_fea[i,0], twodim_fea[i,1]))
+        logger.add_figure("fea_mean_vis", fig, epoch)
         # with open(args.output_dir + "/fea.txt","wb") as f:
         #     np.savetxt(f, fea_list, fmt='%f', delimiter=' ', newline='\r')
         #     f.write(b'\n')

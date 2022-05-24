@@ -171,7 +171,7 @@ def get_equal_len_datasets(dataset1, dataset2):
     return dataset1, dataset2
 
 def get_cub_datasets(train_transform, test_transform, num_train_classes=100, num_auxiliary_classes=50,
-                       num_open_set_classes=50, balance_open_set_eval=False, split_train_val=True, seed=0):
+                       num_open_set_classes=50, balance_open_set_eval=False, split_train_val=True, seed=1):
 
     np.random.seed(seed)
     random_sequence = list(range(200))
