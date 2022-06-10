@@ -187,7 +187,7 @@ def get_args_parser():
                         help='start epoch')
     parser.add_argument('--eval', action='store_true', help='Perform evaluation only')
     parser.add_argument('--dist-eval', action='store_true', default=False, help='Enabling distributed evaluation')
-    parser.add_argument('--num_workers', default=10, type=int)
+    parser.add_argument('--num_workers', default=0, type=int)
     parser.add_argument('--pin-mem', action='store_true',
                         help='Pin CPU memory in DataLoader for more efficient (sometimes) transfer to GPU.')
     parser.add_argument('--no-pin-mem', action='store_false', dest='pin_mem',
@@ -382,8 +382,8 @@ def main(args):
 
     model_without_ddp = model
     if args.distributed:
-        model = torch.nn.parallel.DistributedDataParallel(model, device_ids=[args.gpu], find_unused_parameters=True)
-        # model = torch.nn.parallel.DistributedDataParallel(model, device_ids=[args.gpu])
+        # model = torch.nn.parallel.DistributedDataParallel(model, device_ids=[args.gpu], find_unused_parameters=True)
+        model = torch.nn.parallel.DistributedDataParallel(model, device_ids=[args.gpu])
         model_without_ddp = model.module
     n_parameters = sum(p.numel() for p in model.parameters() if p.requires_grad)
     print('number of params:', n_parameters)
@@ -488,6 +488,7 @@ def main(args):
     best_val_loss = 99999999
 
     means = update_means(model, data_loader_train, args=args, logger=logger, epoch=-1)
+    means = None
     evaluate(test_known_loader, labeled_eval_loader, aux_test_loader, test_unknown_loader, model, device, -1, args,
              logger, means)
     for epoch in range(args.start_epoch, args.epochs):
@@ -505,6 +506,7 @@ def main(args):
                 set_training_mode=args.finetune == '',  # keep in eval mode during finetuning
                 fp32=args.fp32_resume, logger=logger, use_clus=False, aux_set=False, means=means, args=args
             )
+            # print("One epoch training done!")
         else:
             args.wce = 0
             train_stats = train_one_epoch(
@@ -516,11 +518,12 @@ def main(args):
             )
 
         lr_scheduler.step(epoch)
-
+        # print("One epoch training done!")
 
         means = update_means(model, data_loader_train, args=args, logger=logger, epoch=epoch)
 
         val_loss  = evaluate(test_known_loader, labeled_eval_loader, aux_test_loader, test_unknown_loader, model, device, epoch, args, logger, means)
+        # print("Evaluation finished!")
         if val_loss < best_val_loss:
             best_val_loss = val_loss
             if args.output_dir:

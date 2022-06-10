@@ -141,6 +141,7 @@ def get_tiny_image_net_datasets(train_transform, test_transform, num_train_class
         # aux_dataset_known = CustomCub2011(root=cub_root, transform=train_transform, train=True)
         aux_dataset_whole = TinyImageNet(root=tin_val_root_dir, transform=test_transform)
         aux_dataset_known = subsample_classes(aux_dataset_whole, include_classes=auxiliary_classes)
+        # aux_dataset_unknown = subsample_classes(aux_dataset_whole, include_classes=auxiliary_classes)
         train_dataset_whole3 = TinyImageNet(root=tin_train_root_dir, transform=train_transform)
         mix_dataset_train = subsample_classes(train_dataset_whole3, include_classes=train_classes + auxiliary_classes)
         train_dataset_whole4 = TinyImageNet(root=tin_val_root_dir, transform=test_transform)
@@ -165,7 +166,7 @@ def get_tiny_image_net_datasets(train_transform, test_transform, num_train_class
         all_datasets = {
             'train': train_dataset,
             'val': val_dataset,
-            'aux': aux_dataset_known,
+            'aux_test': aux_dataset_known,
             'mix_train': mix_dataset_train,
             'mix_test': mix_dataset_test,
             'test_known': test_dataset_known,

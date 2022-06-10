@@ -128,9 +128,11 @@ def update_means(model, train_data_loader, aux_data_loader=None, args=None, logg
     # print(fea_list.shape)
     fea_tar = np.hstack((target_list, fea_list)).squeeze()
     means_dict = {}
-    for i in np.unique(fea_tar[:, 0]):
+    box_data = []
+    for i in np.sort(np.unique(fea_tar[:, 0])):
         tmp = fea_list[np.where(fea_tar[:, 0] == i)]
         means_dict[i] = np.mean(tmp, axis=0)
+        box_data.append(np.sqrt(np.sum(np.square(tmp - means_dict[i]),axis=1)))
     tmp_means = []
     if aux_data_loader is not None:
         for k in range(args.num_train_classes + args.num_aux_classes):
@@ -151,6 +153,9 @@ def update_means(model, train_data_loader, aux_data_loader=None, args=None, logg
     fig = ax.get_figure()
     logger.add_figure("distance_heatmap", fig, epoch)
 
+    fig, ax = plt.subplots(figsize=(100,6))
+    ax.boxplot(box_data)
+    logger.add_figure("Intra_class_box_plot", fig, epoch)
     return means
 
 def train_one_epoch(model: torch.nn.Module, wce, wclu,
@@ -161,7 +166,9 @@ def train_one_epoch(model: torch.nn.Module, wce, wclu,
                     fp32=False, logger=None, use_clus=False, aux_set=False, means=None, args=None):
     model.train(set_training_mode)
     metric_logger = utils.MetricLogger(delimiter="  ")
+    # print("Log learning rate")
     metric_logger.add_meter('lr', utils.SmoothedValue(window_size=1, fmt='{value:.6f}'))
+    # print("Finished logging learning rate")
     header = 'Epoch: [{}]'.format(epoch)
     print_freq = 10
 
@@ -175,21 +182,28 @@ def train_one_epoch(model: torch.nn.Module, wce, wclu,
     idx = 0
     for images, targets in metric_logger.log_every(data_loader, print_freq, header):
         idx += 1
+        # print("Load images")
         images = images.to(device, non_blocking=True)
+        # print("Load targets")
         targets = targets.to(device, non_blocking=True)
 
+        # print("Calculate loss")
         with torch.cuda.amp.autocast(enabled=not fp32):
 
             re_loss, pred, latent, rec = model(images)
             ce_loss = criterion1(pred, targets)
-
+            # print(re_loss)
+            # print(ce_loss)
+        # print("Add ce and re loss")
         loss = wce * ce_loss + re_loss
         # print(ce_loss)
         # print("1111111")
         # print(re_loss)
         ce_loss_value = ce_loss.item()
 
+
         if use_clus:
+            # print("Calculating clustering loss")
             # fea = model.module.forward_features(images)
             # fea = model.module.encoder.forward_features(images)
             # fea = torch.nn.functional.normalize(fea, p=2)
@@ -243,7 +257,7 @@ def train_one_epoch(model: torch.nn.Module, wce, wclu,
             # DEC loss
             # target_p = target_distribution(fea)
             # clu_loss = loss_function(fea.log(), target_p) / fea.shape[0]
-
+        logger.add_scalar('Train_Loss/total_loss', loss, epoch * niters_per_epoch, idx)
 
             # logger.add_scalar('Train_Loss/clu_loss', clu_loss, epoch * niters_per_epoch + idx)
             # loss += wclu * clu_loss
@@ -278,9 +292,9 @@ def train_one_epoch(model: torch.nn.Module, wce, wclu,
         # logger.add_scalar('Train_Loss/l2_loss', l2_loss, epoch * niters_per_epoch + idx)
 
     # gather the stats from all processes
-    metric_logger.synchronize_between_processes()
-
-    print("Averaged stats:", metric_logger)
+    # metric_logger.synchronize_between_processes()
+    #
+    # print("Averaged stats:", metric_logger)
     return {k: meter.global_avg for k, meter in metric_logger.meters.items()}
 
 def batch_gather_ddp(images):
@@ -332,6 +346,8 @@ def evaluate(known_data_loader, val_data_loader, aux_data_loader, unknown_data_l
     val_clu_loss = 0
     val_ce_loss = 0
     val_re_loss = 0
+    correct = 0
+    total = 0
     # loss_function = torch.nn.KLDivLoss(reduction='sum')
     for images, targets in val_data_loader:
         images = images.to(device, non_blocking=True)
@@ -354,12 +370,12 @@ def evaluate(known_data_loader, val_data_loader, aux_data_loader, unknown_data_l
             # target_p = target_distribution(fea)
             # clu_loss = loss_function(fea.log(), target_p) / fea.shape[0]
 
-            clu_loss = torch.tensor(0.).cuda()
-            for i in range(fea.shape[0]):
-                diff_vec = fea[i] - means[targets_temp[i]]
-                sample_dist_loss = torch.matmul(diff_vec.view(1, -1),
-                                                diff_vec.view(-1, 1))
-                clu_loss += 0.5 * torch.squeeze(sample_dist_loss)
+            # clu_loss = torch.tensor(0.).cuda()
+            # for i in range(fea.shape[0]):
+            #     diff_vec = fea[i] - means[targets_temp[i]]
+            #     sample_dist_loss = torch.matmul(diff_vec.view(1, -1),
+            #                                     diff_vec.view(-1, 1))
+            #     clu_loss += 0.5 * torch.squeeze(sample_dist_loss)
 
             # fea_mod = fea.unsqueeze(1).repeat_interleave(args.num_train_classes, dim=1)
             # # print(fea.shape)
@@ -376,8 +392,10 @@ def evaluate(known_data_loader, val_data_loader, aux_data_loader, unknown_data_l
             #
             # clu_loss = torch.mean(torch.sum(torch.mul(dist, pos_mask), dim=1)) + torch.mean(
             #     torch.sum(torch.mul(1 / dist, pos_mask), dim=1))
-            val_clu_loss += clu_loss
-
+            # val_clu_loss += clu_loss
+            _, pred_cls = torch.max(torch.nn.functional.softmax(pred, dim=0), 1)
+            correct += torch.sum(torch.eq(pred_cls, targets))
+            total += targets.shape[0]
         feas = torch.Tensor.cpu(fea).detach().numpy()
         if fea_list is None:
             fea_list = feas
@@ -394,12 +412,16 @@ def evaluate(known_data_loader, val_data_loader, aux_data_loader, unknown_data_l
     logger.add_scalar('Val/ce_loss', val_ce_loss, epoch)
     logger.add_scalar('Val/re_loss', val_re_loss, epoch)
     logger.add_scalar('Val/clu_loss', val_clu_loss, epoch)
+    logger.add_scalar('Val/cls_acc', correct/total, epoch)
     logger.add_scalar('{}/cls_acc'.format("Val"), val_cls_acc, epoch)
 
     if epoch % 5 == 0:
         fea_list = None
         target_list = None
-
+        k_re_list = []
+        u_re_list = []
+        k_max_prob = None
+        u_max_prob = None
         for images, targets in known_data_loader:
             images = images.to(device, non_blocking=True)
             targets = targets.to(device, non_blocking=True)
@@ -421,6 +443,20 @@ def evaluate(known_data_loader, val_data_loader, aux_data_loader, unknown_data_l
                 target_list = targets_temp
             else:
                 target_list = np.concatenate((target_list, targets_temp))
+            re_loss = torch.Tensor.cpu(re_loss).detach().numpy()
+            # print(re_loss)
+            # if k_re_list is None:
+            #     k_re_list = re_loss
+            # else:
+            #     k_re_list = np.concatenate((k_re_list, re_loss))
+            k_re_list.append(re_loss)
+            max_prob, _ = torch.max(torch.nn.functional.softmax(pred,dim=0),1)
+            max_prob = torch.Tensor.cpu(max_prob).detach().numpy()
+            if k_max_prob is None:
+                k_max_prob = max_prob
+            else:
+                k_max_prob = np.concatenate((k_max_prob, max_prob))
+
 
         for images, targets in aux_data_loader:
             images = images.to(device, non_blocking=True)
@@ -437,6 +473,18 @@ def evaluate(known_data_loader, val_data_loader, aux_data_loader, unknown_data_l
             fea_list = np.vstack((fea_list,feas))
             targets_temp = torch.Tensor.cpu(targets).detach().numpy() + args.num_train_classes
             target_list = np.concatenate((target_list, targets_temp))
+            re_loss = torch.Tensor.cpu(re_loss).numpy()
+            # if u_re_list is None:
+            #     u_re_list = re_loss
+            # else:
+            #     u_re_list = np.concatenate((u_re_list, re_loss))
+            u_re_list.append(re_loss)
+            max_prob, _ = torch.max(torch.nn.functional.softmax(pred,dim=0),1)
+            max_prob = torch.Tensor.cpu(max_prob).detach().numpy()
+            if u_max_prob is None:
+                u_max_prob = max_prob
+            else:
+                u_max_prob = np.concatenate((u_max_prob, max_prob))
 
         known_set_len = target_list.shape[0]
 
@@ -455,6 +503,12 @@ def evaluate(known_data_loader, val_data_loader, aux_data_loader, unknown_data_l
             fea_list = np.vstack((fea_list,feas))
             targets_temp = torch.Tensor.cpu(targets).detach().numpy() + args.num_train_classes + args.num_aux_classes
             target_list = np.concatenate((target_list, targets_temp))
+            re_loss = torch.Tensor.cpu(re_loss).detach().numpy()
+            # u_re_list = np.concatenate((u_re_list, re_loss))
+            u_re_list.append(re_loss)
+            max_prob, _ = torch.max(torch.nn.functional.softmax(pred,dim=0),1)
+            max_prob = torch.Tensor.cpu(max_prob).detach().numpy()
+            u_max_prob = np.concatenate((u_max_prob, max_prob))
 
         kmeans = KMeans(n_clusters=args.num_train_classes, random_state=1).fit(fea_list[:known_set_len])
         cls_acc = cluster_acc(target_list[:known_set_len], kmeans.labels_)
@@ -483,18 +537,60 @@ def evaluate(known_data_loader, val_data_loader, aux_data_loader, unknown_data_l
         color_list = [colors[i] for i in target_list.tolist()]
         fig = plt.figure()
         plt.scatter(twodim_fea[:, 0].tolist(), twodim_fea[:, 1].tolist(), s=2, c=color_list)
-        logger.add_figure("fea_vis", fig, epoch)
+        logger.add_figure("Fea_vis/fea_vis", fig, epoch)
 
-        tsne = TSNE(n_components=2)
-        twodim_fea = tsne.fit_transform(torch.Tensor.cpu(means).detach().numpy())
-        colors = matplotlib.cm.rainbow(
-            np.linspace(0, 1, args.num_train_classes))
-        color_list = colors
+        color_list = ['b' if i < args.num_train_classes else 'r' for i in target_list.tolist()]
         fig = plt.figure()
         plt.scatter(twodim_fea[:, 0].tolist(), twodim_fea[:, 1].tolist(), s=2, c=color_list)
-        for i in range(args.num_train_classes):
-            plt.annotate(str(i), (twodim_fea[i,0], twodim_fea[i,1]))
-        logger.add_figure("fea_mean_vis", fig, epoch)
+        logger.add_figure("Fea_vis/fea_vis_known_unknown", fig, epoch)
+
+        fig = plt.figure()
+        plt.hist(k_re_list, bins=20)
+        # plt.hist(u_re_list, bins=20)
+        # plt.legend(["Known", "Unknown"])
+        logger.add_figure("Re_loss/Known_re_loss_plot", fig, epoch)
+
+        fig = plt.figure()
+        # plt.hist(k_re_list, bins=20)
+        plt.hist(u_re_list, bins=20)
+        # plt.legend(["Known", "Unknown"])
+        logger.add_figure("Re_loss/Unknown_re_loss_plot", fig, epoch)
+
+
+        fig = plt.figure()
+        plt.hist(k_re_list, bins=20)
+        plt.hist(u_re_list, bins=20)
+        plt.legend(["Known", "Unknown"])
+        logger.add_figure("Re_loss/re_loss_plot", fig, epoch)
+
+        fig = plt.figure()
+        plt.hist(k_max_prob, bins=20)
+        # plt.hist(u_max_prob, bins=20)
+        # plt.legend(["Known", "Unknown"])
+        logger.add_figure("Max_prob/Known_max_prob_plot", fig, epoch)
+
+        fig = plt.figure()
+        # plt.hist(k_max_prob, bins=20)
+        plt.hist(u_max_prob, bins=20)
+        # plt.legend(["Known", "Unknown"])
+        logger.add_figure("Max_prob/Unknown_max_prob_plot", fig, epoch)
+
+        fig = plt.figure()
+        plt.hist(k_max_prob, bins=20)
+        plt.hist(u_max_prob, bins=20)
+        plt.legend(["Known", "Unknown"])
+        logger.add_figure("Max_prob/max_prob_plot", fig, epoch)
+
+        # tsne = TSNE(n_components=2)
+        # twodim_fea = tsne.fit_transform(torch.Tensor.cpu(means).detach().numpy())
+        # colors = matplotlib.cm.rainbow(
+        #     np.linspace(0, 1, args.num_train_classes))
+        # color_list = colors
+        # fig = plt.figure()
+        # plt.scatter(twodim_fea[:, 0].tolist(), twodim_fea[:, 1].tolist(), s=2, c=color_list)
+        # for i in range(args.num_train_classes):
+        #     plt.annotate(str(i), (twodim_fea[i,0], twodim_fea[i,1]))
+        # logger.add_figure("fea_mean_vis", fig, epoch)
         # with open(args.output_dir + "/fea.txt","wb") as f:
         #     np.savetxt(f, fea_list, fmt='%f', delimiter=' ', newline='\r')
         #     f.write(b'\n')
