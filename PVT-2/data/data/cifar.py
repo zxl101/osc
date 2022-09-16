@@ -122,7 +122,9 @@ def get_cifar10_datasets(train_transform, test_transform, num_train_classes=5, n
     if auxiliary_classes is not None:
         # aux_dataset_known = CustomCub2011(root=cub_root, transform=train_transform, train=True)
         aux_dataset_whole = CustomCIFAR10(root=cifar_10_root, transform=test_transform, train=False)
-        aux_dataset_known = subsample_classes(aux_dataset_whole, include_classes=auxiliary_classes)
+        aux_dataset_test = subsample_classes(aux_dataset_whole, include_classes=auxiliary_classes)
+        aux_dataset_whole2 = CustomCIFAR10(root=cifar_10_root, transform=train_transform, train=True)
+        aux_dataset_train = subsample_classes(aux_dataset_whole2, include_classes=auxiliary_classes)
         train_dataset_whole3 = CustomCIFAR10(root=cifar_10_root, transform=train_transform, train=True)
         mix_dataset_train = subsample_classes(train_dataset_whole3, include_classes=train_classes+auxiliary_classes)
         train_dataset_whole4 = CustomCIFAR10(root=cifar_10_root, transform=test_transform, train=False)
@@ -147,7 +149,8 @@ def get_cifar10_datasets(train_transform, test_transform, num_train_classes=5, n
         all_datasets = {
             'train': train_dataset,
             'val': val_dataset,
-            'aux': aux_dataset_known,
+            'aux_train': aux_dataset_train,
+            'aux_test': aux_dataset_test,
             'mix_train': mix_dataset_train,
             'mix_test': mix_dataset_test,
             'test_known': test_dataset_known,
@@ -185,7 +188,9 @@ def get_cifar100_datasets(train_transform, test_transform, num_train_classes=80,
     if auxiliary_classes is not None:
         # aux_dataset_known = CustomCub2011(root=cub_root, transform=train_transform, train=True)
         aux_dataset_whole = CustomCIFAR100(root=cifar_100_root, transform=test_transform, train=False)
-        aux_dataset_known = subsample_classes(aux_dataset_whole, include_classes=auxiliary_classes)
+        aux_dataset_test = subsample_classes(aux_dataset_whole, include_classes=auxiliary_classes)
+        aux_dataset_whole2 = CustomCIFAR100(root=cifar_100_root, transform=train_transform, train=True)
+        aux_dataset_train = subsample_classes(aux_dataset_whole2, include_classes=auxiliary_classes)
         train_dataset_whole3 = CustomCIFAR100(root=cifar_100_root, transform=train_transform, train=True)
         mix_dataset_train = subsample_classes(train_dataset_whole3, include_classes=train_classes+auxiliary_classes)
         train_dataset_whole4 = CustomCIFAR100(root=cifar_100_root, transform=test_transform, train=False)
@@ -210,7 +215,8 @@ def get_cifar100_datasets(train_transform, test_transform, num_train_classes=80,
         all_datasets = {
             'train': train_dataset,
             'val': val_dataset,
-            'aux': aux_dataset_known,
+            'aux_train': aux_dataset_train,
+            'aux_test': aux_dataset_test,
             'mix_train': mix_dataset_train,
             'mix_test': mix_dataset_test,
             'test_known': test_dataset_known,

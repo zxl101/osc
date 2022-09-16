@@ -68,12 +68,17 @@ class Solarization(object):
             return img
 
 
-def load_pretrained_weights(model, pretrained_weights, checkpoint_key, model_name, patch_size):
+def load_pretrained_weights(model, pretrained_weights, checkpoint_key, model_name, patch_size, remove_prefix=False):
     if os.path.isfile(pretrained_weights):
         if ".npz" in pretrained_weights:
             state_dict = np.load(pretrained_weights)
         else:
             state_dict = torch.load(pretrained_weights, map_location="cpu")
+        if remove_prefix:
+            for k in list(state_dict.keys()):
+                if k.startswith("backbone."):
+                    state_dict[k.replace("backbone.","")] = state_dict[k]
+                    del state_dict[k]
         if checkpoint_key is not None and checkpoint_key in state_dict:
             print(f"Take key {checkpoint_key} in provided checkpoint dict")
             state_dict = state_dict[checkpoint_key]
@@ -615,8 +620,8 @@ class MultiCropWrapper(nn.Module):
         # disable layers dedicated to ImageNet labels classification
         backbone.fc, backbone.head = nn.Identity(), nn.Identity()
         self.backbone = backbone
-        self.head1 = head1
-        self.head2 = head2
+        self.head = head
+        # self.head2 = head2
 
     def forward(self, x, clus_fea=False):
         # convert to list
@@ -637,11 +642,11 @@ class MultiCropWrapper(nn.Module):
             output = torch.cat((output, _out))
             start_idx = end_idx
         # Run the head forward on the concatenated features.
-        if self.head2 is None or not clus_fea:
-            return self.head1(output)
-        else:
-            return self.head1(output), self.head2(output)
-
+        # if self.head2 is None or not clus_fea:
+        #     return self.head1(output)
+        # else:
+        #     return self.head1(output), self.head2(output)
+        return self.head(output)
     def forward_features(self, x):
         # convert to list
         if not isinstance(x, list):

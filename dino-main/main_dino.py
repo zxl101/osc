@@ -34,6 +34,7 @@ from tensorboardX import SummaryWriter
 import logging
 from torch.utils.data import DataLoader
 from data.data.cub import CustomCub2011, get_cub_datasets
+from data.data.nabird import CustomNABirdV1, get_nabird_datasets
 from data.data.stanford_cars import CarsDataset, get_scar_datasets
 from data.data.cifar import get_cifar10_datasets, get_cifar100_datasets
 from data.data.tinyimagenet import get_tiny_image_net_datasets
@@ -43,6 +44,7 @@ from sklearn.utils.linear_assignment_ import linear_assignment
 import utils
 import vision_transformer as vits
 from vision_transformer import DINOHead
+from models_mae import MaskedAutoencoderViT
 
 torchvision_archs = sorted(name for name in torchvision_models.__dict__
     if name.islower() and not name.startswith("__")
@@ -56,6 +58,9 @@ def get_args_parser():
     parser.add_argument('--num_train_classes', default=None, type=int)
     parser.add_argument('--num_aux_classes', default=None, type=int)
     parser.add_argument('--num_test_classes', default=None, type=int)
+    parser.add_argument('--wce', default=1, type=float)
+    parser.add_argument('--wdino', default=1, type=float)
+    parser.add_argument('--wclu', default=1, type=float)
     parser.add_argument('--arch', default='vit_small', type=str,
         choices=['vit_tiny', 'vit_small', 'vit_base', 'xcit', 'deit_tiny', 'deit_small'] ,
             # \    + torchvision_archs + torch.hub.list("facebookresearch/xcit:main"),
@@ -66,13 +71,13 @@ def get_args_parser():
         values leads to better performance but requires more memory. Applies only
         for ViTs (vit_tiny, vit_small and vit_base). If <16, we recommend disabling
         mixed precision training (--use_fp16 false) to avoid unstabilities.""")
-    parser.add_argument('--out_dim', default=65536, type=int, help="""Dimensionality of
+    parser.add_argument('--out_dim', default=2048, type=int, help="""Dimensionality of
         the DINO head output. For complex and large datasets large values (like 65k) work well.""")
     parser.add_argument('--norm_last_layer', default=True, type=utils.bool_flag,
         help="""Whether or not to weight normalize the last layer of the DINO head.
         Not normalizing leads to better performance but can make the training unstable.
         In our experiments, we typically set this paramater to False with vit_small and True with vit_base.""")
-    parser.add_argument('--momentum_teacher', default=0.996, type=float, help="""Base EMA
+    parser.add_argument('--momentum_teacher', default=0.9995, type=float, help="""Base EMA
         parameter for teacher update. The value is increased to 1 during training with cosine schedule.
         We recommend setting a higher value with small batches: for example use 0.9995 with batch size of 256.""")
     parser.add_argument('--use_bn_in_head', default=False, type=utils.bool_flag,
@@ -122,14 +127,14 @@ def get_args_parser():
     parser.add_argument('--drop_path_rate', type=float, default=0.1, help="stochastic depth rate")
 
     # Multi-crop parameters
-    parser.add_argument('--global_crops_scale', type=float, nargs='+', default=(0.4, 1.),
+    parser.add_argument('--global_crops_scale', type=float, nargs='+', default=(0.8, 1.),
         help="""Scale range of the cropped image before resizing, relatively to the origin image.
         Used for large global view cropping. When disabling multi-crop (--local_crops_number 0), we
         recommand using a wider range of scale ("--global_crops_scale 0.14 1." for example)""")
     parser.add_argument('--local_crops_number', type=int, default=8, help="""Number of small
         local views to generate. Set this parameter to 0 to disable multi-crop training.
         When disabling multi-crop we recommend to use "--global_crops_scale 0.14 1." """)
-    parser.add_argument('--local_crops_scale', type=float, nargs='+', default=(0.05, 0.4),
+    parser.add_argument('--local_crops_scale', type=float, nargs='+', default=(0.3, 0.5),
         help="""Scale range of the cropped image before resizing, relatively to the origin image.
         Used for small local view cropping of multi-crop.""")
     parser.add_argument('--clus_dim', default=2, type=int)
@@ -138,7 +143,7 @@ def get_args_parser():
     parser.add_argument('--data_path', default='/path/to/imagenet/train/', type=str,
         help='Please specify path to the ImageNet training data.')
     parser.add_argument('--output_dir', default="./checkpoints/", type=str, help='Path to save logs and checkpoints.')
-    parser.add_argument('--saveckp_freq', default=20, type=int, help='Save checkpoint every x epochs.')
+    parser.add_argument('--saveckp_freq', default=5, type=int, help='Save checkpoint every x epochs.')
     parser.add_argument('--seed', default=0, type=int, help='Random seed.')
     parser.add_argument('--num_workers', default=10, type=int, help='Number of data loading workers per GPU.')
     parser.add_argument("--dist_url", default="env://", type=str, help="""url used to set up
@@ -165,7 +170,7 @@ def train_dino(args):
     test_transform = transforms.Compose([
         transforms.Resize((args.input_size, args.input_size)),
         transforms.ToTensor(),
-        # transforms.Normalize((0.4914, 0.4822, 0.4465), (0.2023, 0.1994, 0.2010)),
+        transforms.Normalize((0.485, 0.456, 0.406), (0.229, 0.224, 0.225)),
     ])
     if args.dataset == 'CUB':
         args.nb_classes = 100
@@ -173,8 +178,18 @@ def train_dino(args):
         if args.num_train_classes is not None:
             datasets = get_cub_datasets(train_transform, test_transform, seed=args.seed, num_train_classes=args.num_train_classes,
                                         num_auxiliary_classes=args.num_aux_classes, num_open_set_classes=args.num_test_classes)
+            args.nb_classes = args.num_train_classes
         else:
             datasets = get_cub_datasets(train_transform, test_transform, seed=args.seed)
+    elif args.dataset == 'NABird':
+        args.nb_classes = 304
+        args.input_size = 224
+        if args.num_train_classes is not None:
+            datasets = get_nabird_datasets(train_transform, test_transform, seed=args.seed, num_train_classes=args.num_train_classes,
+                                    num_auxiliary_classes=args.num_aux_classes, num_open_set_classes=args.num_test_classes)
+            args.nb_classes = args.num_train_classes
+        else:
+            datasets = get_nabird_datasets(train_transform. test_transform, seed=args.seed)
     elif args.dataset == 'SCAR':
         args.nb_classes = 98
         args.input_size = 224
@@ -210,23 +225,11 @@ def train_dino(args):
                                      shuffle=False, sampler=None, num_workers=args.num_workers)
     test_known_loader = DataLoader(datasets['test_known'], batch_size=args.batch_size,
                                    shuffle=False, sampler=None, num_workers=args.num_workers)
-    data_loader_train = labeled_train_loader
-    data_loader_val = labeled_eval_loader
-
-
-    # dataset = datasets.ImageFolder(args.data_path, transform=transform)
-    # sampler = torch.utils.data.DistributedSampler(dataset, shuffle=True)
-    # data_loader = torch.utils.data.DataLoader(
-    #     dataset,
-    #     sampler=sampler,
-    #     batch_size=args.batch_size_per_gpu,
-    #     num_workers=args.num_workers,
-    #     pin_memory=True,
-    #     drop_last=True,
-    # )
-    # print(f"Data loaded: there are {len(datasets['mix_train'])} images.")
-
-    # global means
+    # data_loader_train = labeled_train_loader
+    # data_loader_val = labeled_eval_loader
+    # print(len(labeled_train_loader))
+    # print(len(test_known_loader))
+    # print(len(test_unknown_loader))
 
     # ============ building student and teacher networks ... ============
     # we changed the name DeiT-S for ViT-S to avoid confusions
@@ -238,6 +241,8 @@ def train_dino(args):
             drop_path_rate=args.drop_path_rate,  # stochastic depth
         )
         teacher = vits.__dict__[args.arch](patch_size=args.patch_size)
+        # print("Loading MAE as teacher!")
+        # teacher = MaskedAutoencoderViT(embed_dim=768, depth=12)
         embed_dim = student.embed_dim
     # if the network is a XCiT
     elif args.arch in torch.hub.list("facebookresearch/xcit:main"):
@@ -260,12 +265,12 @@ def train_dino(args):
         use_bn=args.use_bn_in_head,
         norm_last_layer=args.norm_last_layer,
     ),
-         DINOHead(
-             embed_dim,
-             args.clus_dim,
-             use_bn=args.use_bn_in_head,
-             norm_last_layer=args.norm_last_layer,
-         )
+         # DINOHead(
+         #     embed_dim,
+         #     args.clus_dim,
+         #     use_bn=args.use_bn_in_head,
+         #     norm_last_layer=args.norm_last_layer,
+         # )
                                      )
     teacher = utils.MultiCropWrapper(
         teacher,
@@ -279,7 +284,7 @@ def train_dino(args):
         if args.teacher_ssl:
             utils.load_pretrained_weights(teacher, args.pretrained_weights, 'teacher', args.arch, args.patch_size)
         else:
-            utils.load_pretrained_weights(teacher, "imagenet_pretrained.pth", 'teacher', args.arch, args.patch_size)
+            utils.load_pretrained_weights(teacher, "imagenet_pretrained.pth", 'teacher', args.arch, args.patch_size, remove_prefix=True)
         if args.student_ssl:
             utils.load_pretrained_weights(student, args.pretrained_weights, 'student', args.arch, args.patch_size)
         else:
@@ -361,7 +366,8 @@ def train_dino(args):
         temp_name += "_sss"
     else:
         temp_name += "_ss"
-    args.output_dir = os.path.join(args.output_dir,args.dataset+temp_name)
+    args.output_dir = os.path.join(args.output_dir,args.dataset+temp_name,
+                                   str(args.wdino)+"_"+str(args.wclu)+"_"+str(args.wce)+"_"+datetime.datetime.now().strftime("%d_%m_%Y_%H_%M_%S"))
     if not os.path.exists(args.output_dir):
         os.makedirs(args.output_dir)
 
@@ -390,6 +396,12 @@ def train_dino(args):
 
     start_time = time.time()
     print("Starting DINO training !")
+    epoch = -1
+    # _ = evaluate(test_known_loader, student, dino_loss, epoch, logger, "Val")
+    # if args.num_aux_classes != 0:
+    #     _ = evaluate(aux_test_loader, student, dino_loss, epoch, logger, "Aux")
+    _ = evaluate(test_unknown_loader, student, dino_loss, epoch, logger, "Unknown")
+
     for epoch in range(start_epoch, args.epochs):
         # labeled_train_loader .sampler.set_epoch(epoch)
 
@@ -399,7 +411,7 @@ def train_dino(args):
                 labeled_train_loader , optimizer, lr_schedule, wd_schedule, momentum_schedule,
                 epoch, fp16_scaler, args, logger)
         else:
-            means = update_means(student, labeled_train_loader, aux_train_loader, args)
+            # means = update_means(student, labeled_train_loader, aux_train_loader, args)
             train_stats = train_one_epoch_clus(student, teacher, teacher_without_ddp, dino_loss,
                                           labeled_train_loader, aux_train_loader, optimizer, lr_schedule, wd_schedule, momentum_schedule,
                                           epoch, fp16_scaler, args, logger, means)
@@ -424,8 +436,9 @@ def train_dino(args):
             with (Path(args.output_dir) / "log.txt").open("a") as f:
                 f.write(json.dumps(log_stats) + "\n")
         if epoch % 5 == 0:
-            _ = evaluate(test_known_loader, student, dino_loss, epoch, logger, "Val")
-            _ = evaluate(aux_test_loader, student, dino_loss, epoch, logger, "Aux")
+            # _ = evaluate(test_known_loader, student, dino_loss, epoch, logger, "Val")
+            # if args.num_aux_classes != 0:
+            #     _ = evaluate(aux_test_loader, student, dino_loss, epoch, logger, "Aux")
             _ = evaluate(test_unknown_loader, student, dino_loss, epoch, logger, "Unknown")
     total_time = time.time() - start_time
     total_time_str = str(datetime.timedelta(seconds=int(total_time)))
@@ -458,12 +471,14 @@ def train_one_epoch(student, teacher, teacher_without_ddp, dino_loss, data_loade
         with torch.cuda.amp.autocast(fp16_scaler is not None):
             teacher_output = teacher(images[:2])  # only the 2 global views pass through the teacher
             student_output = student(images, clus_fea=False)
-            d_loss, ce_loss = dino_loss(student_output, teacher_output, label, epoch)
+            # print(teacher_output.shape)
+            # print(student_output.shape)
+            d_loss = dino_loss(student_output, teacher_output, label, epoch)
             logger.add_scalar('Train_Loss/dino_loss', d_loss, epoch * niters_per_epoch + idx)
-            logger.add_scalar('Train_Loss/ce_loss', ce_loss, epoch * niters_per_epoch + idx)
-
-            loss = 0.5 * d_loss + ce_loss
-
+            # logger.add_scalar('Train_Loss/ce_loss', ce_loss, epoch * niters_per_epoch + idx)
+            # logger.add_scalar('Train_Loss/re_loss', mae_loss, epoch * niters_per_epoch + idx)
+            # mae_loss = torch.mean(mae_loss)
+            loss = 0.5 * d_loss
 
         if not math.isfinite(loss.item()):
             print("Loss is {}, stopping training".format(loss.item()), force=True)
@@ -500,6 +515,8 @@ def train_one_epoch(student, teacher, teacher_without_ddp, dino_loss, data_loade
         metric_logger.update(loss=loss.item())
         metric_logger.update(lr=optimizer.param_groups[0]["lr"])
         metric_logger.update(wd=optimizer.param_groups[0]["weight_decay"])
+
+        # break
     # gather the stats from all processes
     metric_logger.synchronize_between_processes()
     print("Averaged stats:", metric_logger)
@@ -536,9 +553,9 @@ def train_loss(student, teacher,teacher_without_ddp, dino_loss, data_loader, opt
             else:
                 student_output = student(images)
 
-            d_loss, ce_loss = dino_loss(student_output, teacher_output, label, epoch)
+            d_loss = dino_loss(student_output, teacher_output, label, epoch)
             logger.add_scalar('Train_Loss/dino_loss', d_loss, epoch * niters_per_epoch + idx)
-            loss = d_loss
+            loss = args.wdino * d_loss
             if use_clus:
                 # fea = student.module.forward_features(images)
                 fea = student_output2
@@ -562,12 +579,12 @@ def train_loss(student, teacher,teacher_without_ddp, dino_loss, data_loader, opt
                 # print(mask.shape)
                 clu_loss = torch.mean(torch.sum(torch.mul(dist, mask), dim=1)) / fea.shape[1] * 10
                 logger.add_scalar('Train_Loss/clu_loss', clu_loss, epoch * niters_per_epoch + idx)
-                loss += clu_loss
+                loss += args.wclu * clu_loss
 
-            if use_ce:
-                logger.add_scalar('Train_Loss/ce_loss', ce_loss, epoch * niters_per_epoch + idx)
-            # logger.add_scalar('Train_Loss/clu_loss', clu_loss, epoch * niters_per_epoch + idx)
-                loss += 0.5 * ce_loss
+            # if use_ce:
+            #     logger.add_scalar('Train_Loss/ce_loss', ce_loss, epoch * niters_per_epoch + idx)
+            # # logger.add_scalar('Train_Loss/clu_loss', clu_loss, epoch * niters_per_epoch + idx)
+            #     loss += args.wce * ce_loss
 
         if not math.isfinite(loss.item()):
             print("Loss is {}, stopping training".format(loss.item()), force=True)
@@ -677,10 +694,9 @@ def update_means(student, train_data_loader, aux_data_loader, args):
 
     target_list = target_list.squeeze().repeat(args.local_crops_number + 2)
     target_list = np.expand_dims(target_list, axis=1)
-    # print(target_list.shape)
-    # print(fea_list.shape)
+
     fea_tar = np.hstack((target_list, fea_list)).squeeze()
-    # print(fea_tar.shape)
+
     means_dict = {}
     for i in np.unique(fea_tar[:, 0]):
         tmp = fea_list[np.where(fea_tar[:, 0] == i)]
@@ -747,9 +763,9 @@ def evaluate(data_loader, model, dino_loss, epoch, logger=None, name="Val", reco
 
         # compute output
         with torch.cuda.amp.autocast():
-            outputs = model(images)
-            # fea = model.module.forward_features(images)
-            fea = model(images)
+            # outputs = model(images)
+            fea = model.module.forward_features(images)
+            # fea = model(images)
             # d_loss, ce_loss = criterion(outputs, output targets)
             # clu_loss = criterion2(fea, targets)
             # ce_loss = criterion1(samples, outputs, targets)
@@ -777,8 +793,8 @@ def evaluate(data_loader, model, dino_loss, epoch, logger=None, name="Val", reco
         #     metric_logger.update(loss=ce_loss.item())
         #     metric_logger.meters['acc1'].update(acc1.item(), n=batch_size)
         #     metric_logger.meters['acc5'].update(acc5.item(), n=batch_size)
-
-
+        # break
+    print("Kmeans clustering!")
     kmeans = KMeans(n_clusters=len(set(target_list)), random_state=1).fit(fea_list)
     # print(target_list.shape)
     # print(len(kmeans.labels_))
@@ -840,9 +856,9 @@ class DINOLoss(nn.Module):
         teacher_out = teacher_out.detach().chunk(2)
 
         total_dino_loss = 0
-        total_ce_loss = 0
+        # total_ce_loss = 0
         n_dino_loss_terms = 0
-        n_ce_loss_terms = 0
+        # n_ce_loss_terms = 0
         # for iq, q in enumerate(teacher_out):
         #     for v in range(len(student_out)):
         for v in range(len(student_out)):
@@ -853,12 +869,12 @@ class DINOLoss(nn.Module):
                 loss = torch.sum(-q * F.log_softmax(student_out[v], dim=-1), dim=-1)
                 total_dino_loss += loss.mean()
                 n_dino_loss_terms += 1
-            total_ce_loss += self.ce_loss(student_out[v], label)
-            n_ce_loss_terms += 1
-        total_ce_loss /= n_ce_loss_terms
+            # total_ce_loss += self.ce_loss(student_out[v], label)
+            # n_ce_loss_terms += 1
+        # total_ce_loss /= n_ce_loss_terms
         total_dino_loss /= n_dino_loss_terms
         self.update_center(teacher_output)
-        return total_dino_loss, total_ce_loss
+        return total_dino_loss
 
     @torch.no_grad()
     def update_center(self, teacher_output):

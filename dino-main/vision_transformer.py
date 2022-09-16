@@ -226,21 +226,25 @@ class VisionTransformer(nn.Module):
     def prepare_tokens(self, x):
         B, nc, w, h = x.shape
         x = self.patch_embed(x)  # patch linear embedding
-
+        # print(x.shape)
         # add the [CLS] token to the embed patch tokens
         cls_tokens = self.cls_token.expand(B, -1, -1)
         x = torch.cat((cls_tokens, x), dim=1)
-
+        # print(x.shape)
         # add positional encoding to each token
         x = x + self.interpolate_pos_encoding(x, w, h)
-
+        # print(x.shape)
         return self.pos_drop(x)
 
     def forward(self, x):
         x = self.prepare_tokens(x)
         for blk in self.blocks:
             x = blk(x)
+        # print(x.shape)
         x = self.norm(x)
+        # print(x.shape)
+        # print(x.shape)
+        # print(x[:,0].shape)
         return x[:, 0]
 
     def get_last_selfattention(self, x):

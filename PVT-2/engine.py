@@ -8,6 +8,7 @@ import sys
 from typing import Iterable, Optional
 import matplotlib.pyplot as plt
 import matplotlib
+import os
 
 import torch
 from torchvision.utils import make_grid
@@ -19,7 +20,10 @@ from timm.utils import accuracy, ModelEma
 from losses import DistillationLoss, SupCluLoss
 import utils
 import diffdist
+from pytorch_grad_cam import GradCAM
+from pytorch_grad_cam.utils.image import show_cam_on_image
 
+import torchvision.transforms as transforms
 from sklearn.cluster import KMeans, DBSCAN, AgglomerativeClustering
 from sklearn.metrics.cluster import normalized_mutual_info_score as nmi_score
 from sklearn.metrics import adjusted_rand_score as ari_score
@@ -27,6 +31,7 @@ from sklearn.utils.linear_assignment_ import linear_assignment
 from sklearn.manifold import TSNE
 from scipy.spatial import distance_matrix
 import seaborn as sns
+from PIL import Image
 # from scipy.optimize import linear_sum_assignment as linear_assignment
 
 from dec import target_distribution
@@ -86,9 +91,9 @@ def update_means(model, train_data_loader, aux_data_loader=None, args=None, logg
             label = label.cuda(non_blocking=True)
 
             # fea = student.module.forward_features(images)
-            # fea = model.module.forward_features(images)
+            fea = model.module.forward_features(images)
             # fea = model.module.encoder.forward_features(images)
-            _, _, fea, _ = model(images)
+            # _, _, fea, _ = model(images)
             # fea = torch.nn.functional.normalize(fea, p=2)
             feas = torch.Tensor.cpu(fea).detach().numpy()
             # print(feas.shape)
@@ -108,8 +113,8 @@ def update_means(model, train_data_loader, aux_data_loader=None, args=None, logg
                 images = [im.cuda(non_blocking=True) for im in images]
                 label = label.cuda(non_blocking=True)
 
-                # fea = student.module.forward_features(images)
-                _, fea = model(images)
+                fea = student.module.forward_features(images)
+                # _, fea = model(images)
                 feas = torch.Tensor.cpu(fea).detach().numpy()
                 if fea_list is None:
                     fea_list = feas
@@ -189,13 +194,14 @@ def train_one_epoch(model: torch.nn.Module, wce, wclu,
 
         # print("Calculate loss")
         with torch.cuda.amp.autocast(enabled=not fp32):
-
-            re_loss, pred, latent, rec = model(images)
+            pred = model(images)
+            # re_loss, pred, latent, rec = model(images)
             ce_loss = criterion1(pred, targets)
             # print(re_loss)
             # print(ce_loss)
         # print("Add ce and re loss")
-        loss = wce * ce_loss + re_loss
+        # loss = wce * ce_loss + re_loss
+        loss = ce_loss
         # print(ce_loss)
         # print("1111111")
         # print(re_loss)
@@ -215,19 +221,19 @@ def train_one_epoch(model: torch.nn.Module, wce, wclu,
             targets_temp = targets_temp.reshape(-1)
 
             # fea = fea.unsqueeze(1).repeat_interleave(args.num_train_classes + args.num_aux_classes, dim=1)
-            # fea = fea.unsqueeze(1).repeat_interleave(args.num_train_classes, dim=1)
+            fea = fea.unsqueeze(1).repeat_interleave(args.num_train_classes, dim=1)
             #
-            # dist = torch.sqrt(torch.sum(torch.square(fea - means), dim=-1))
+            dist = torch.sqrt(torch.sum(torch.square(fea - means), dim=-1))
             # # mask = torch.full((fea.shape[0], args.num_train_classes + args.num_aux_classes), -1, dtype=int).cuda()
-            # pos_mask = torch.full((fea.shape[0], args.num_train_classes), 0, dtype=int).cuda()
+            pos_mask = torch.full((fea.shape[0], args.num_train_classes), 0, dtype=int).cuda()
             # neg_mask = torch.full((fea.shape[0], args.num_train_classes), 1, dtype=int).cuda()
-            # for id, index in enumerate(targets_temp):
-            #     # mask[id, index] = args.num_train_classes
-            #     pos_mask[id, index] = 1
-            #     neg_mask[id, index] = 1
+            for id, index in enumerate(targets_temp):
+                # mask[id, index] = args.num_train_classes
+                pos_mask[id, index] = 1
+                # neg_mask[id, index] = 1
             #
-            # clu_loss = torch.mean(torch.sum(torch.mul(dist, pos_mask), dim=1)) + torch.mean(
-            #     torch.sum(torch.mul(1 / dist, pos_mask), dim=1))
+            clu_loss = torch.mean(torch.sum(torch.mul(dist, pos_mask), dim=1)) + torch.mean(
+                torch.sum(torch.mul(1 / dist, pos_mask), dim=1))
             # print(mask)
             #
             # # DCN loss
@@ -238,28 +244,30 @@ def train_one_epoch(model: torch.nn.Module, wce, wclu,
             #                                     diff_vec.view(-1,1))
             #     clu_loss += 0.5 * torch.squeeze(sample_dist_loss)
 
-            # CAC loss
-            # distance matrix from feature to class anchors
-            fea = fea.unsqueeze(1).expand(-1, args.num_train_classes, -1)
-            anchors = means.unsqueeze(0).expand(fea.shape[0],-1,-1)
-            dist = torch.norm(fea - anchors, 2, 2)
-            true = torch.gather(dist, 1, targets.view(-1,1)).view(-1)
-            non_gt = torch.Tensor([[i for i in range(args.num_train_classes) if targets[x] !=i] for x in range(len(dist))]).long().cuda()
-            others = torch.gather(dist, 1, non_gt)
-            anchor = torch.mean(true)
-            tuplet = torch.exp(-others+true.unsqueeze(1))
-            tuplet = torch.mean(torch.log(1+torch.sum(tuplet, dim=1)))
-
-            logger.add_scalar('Train_Loss/anchor_loss', anchor, epoch * niters_per_epoch + idx)
-            logger.add_scalar('Train_Loss/tuplet_loss', tuplet, epoch * niters_per_epoch + idx)
-            loss += 0.1 * anchor + tuplet
+            # # CAC loss
+            # # distance matrix from feature to class anchors
+            # fea = fea.unsqueeze(1).expand(-1, args.num_train_classes, -1)
+            # anchors = means.unsqueeze(0).expand(fea.shape[0],-1,-1)
+            # dist = torch.norm(fea - anchors, 2, 2)
+            # true = torch.gather(dist, 1, targets.view(-1,1)).view(-1)
+            # non_gt = torch.Tensor([[i for i in range(args.num_train_classes) if targets[x] !=i] for x in range(len(dist))]).long().cuda()
+            # others = torch.gather(dist, 1, non_gt)
+            # anchor = torch.mean(true)
+            # tuplet = torch.exp(-others+true.unsqueeze(1))
+            # tuplet = torch.mean(torch.log(1+torch.sum(tuplet, dim=1)))
+            #
+            # logger.add_scalar('Train_Loss/anchor_loss', anchor, epoch * niters_per_epoch + idx)
+            # logger.add_scalar('Train_Loss/tuplet_loss', tuplet, epoch * niters_per_epoch + idx)
+            # loss += 0.1 * anchor + tuplet
 
             # DEC loss
             # target_p = target_distribution(fea)
             # clu_loss = loss_function(fea.log(), target_p) / fea.shape[0]
+            loss += args.wclu * clu_loss
+            logger.add_scalar('Train_Loss/clu_loss', clu_loss, epoch * niters_per_epoch + idx)
         logger.add_scalar('Train_Loss/total_loss', loss, epoch * niters_per_epoch, idx)
 
-            # logger.add_scalar('Train_Loss/clu_loss', clu_loss, epoch * niters_per_epoch + idx)
+
             # loss += wclu * clu_loss
 
 
@@ -282,13 +290,13 @@ def train_one_epoch(model: torch.nn.Module, wce, wclu,
         metric_logger.update(lr=optimizer.param_groups[0]["lr"])
 
         logger.add_scalar('Train_Loss/ce_loss', ce_loss, epoch * niters_per_epoch + idx)
-        logger.add_scalar('Train_Loss/re_loss', re_loss, epoch * niters_per_epoch + idx)
-        if idx == 5:
-            # print(rec.shape)
-            img_grid = make_grid(rec, nrow=4)
-            logger.add_image('Train/reconstructed', img_grid,epoch)
-            img_grid = make_grid(images, nrow=4)
-            logger.add_image('Train/original', img_grid, epoch)
+        # logger.add_scalar('Train_Loss/re_loss', re_loss, epoch * niters_per_epoch + idx)
+        # if idx == 5:
+        #     # print(rec.shape)
+        #     img_grid = make_grid(rec, nrow=4)
+        #     logger.add_image('Train/reconstructed', img_grid,epoch)
+        #     img_grid = make_grid(images, nrow=4)
+        #     logger.add_image('Train/original', img_grid, epoch)
         # logger.add_scalar('Train_Loss/l2_loss', l2_loss, epoch * niters_per_epoch + idx)
 
     # gather the stats from all processes
@@ -345,23 +353,27 @@ def evaluate(known_data_loader, val_data_loader, aux_data_loader, unknown_data_l
 
     val_clu_loss = 0
     val_ce_loss = 0
-    val_re_loss = 0
+    # val_re_loss = 0
     correct = 0
     total = 0
     # loss_function = torch.nn.KLDivLoss(reduction='sum')
+    # vis_attention(model, args, output_dir= os.path.join(args.output_dir, "vis_attention"), epoch=epoch)
     for images, targets in val_data_loader:
         images = images.to(device, non_blocking=True)
         targets = targets.to(device, non_blocking=True)
 
         # compute output
         with torch.cuda.amp.autocast():
-            # outputs = model(images)
-            re_loss, pred, fea, rec = model(images)
+
+            pred = model(images)
+            # re_loss, pred, fea, rec = model(images)
             # fea = model.module.forward_features(images)
+            fea = model.forward_features(images)
+            # print(fea.shape)
             # fea = model.module.encoder.forward_features(images)
             # fea = torch.nn.functional.normalize(fea, p=2)
             ce_loss = criterion1(pred, targets)
-            val_re_loss += re_loss
+            # val_re_loss += re_loss
             val_ce_loss += ce_loss
 
             targets_temp = torch.Tensor.cpu(targets).detach().numpy()
@@ -410,7 +422,7 @@ def evaluate(known_data_loader, val_data_loader, aux_data_loader, unknown_data_l
     kmeans = KMeans(n_clusters=args.num_train_classes, random_state=1).fit(fea_list)
     val_cls_acc = cluster_acc(target_list, kmeans.labels_)
     logger.add_scalar('Val/ce_loss', val_ce_loss, epoch)
-    logger.add_scalar('Val/re_loss', val_re_loss, epoch)
+    # logger.add_scalar('Val/re_loss', val_re_loss, epoch)
     logger.add_scalar('Val/clu_loss', val_clu_loss, epoch)
     logger.add_scalar('Val/cls_acc', correct/total, epoch)
     logger.add_scalar('{}/cls_acc'.format("Val"), val_cls_acc, epoch)
@@ -429,7 +441,8 @@ def evaluate(known_data_loader, val_data_loader, aux_data_loader, unknown_data_l
             # compute output
             with torch.cuda.amp.autocast():
                 # fea = model.module.forward_features(images)
-                re_loss, pred, fea, rec = model(images)
+                fea = model.forward_features(images)
+                # re_loss, pred, fea, rec = model(images)
                 # fea = model.module.encoder.forward_features(images)
                 # fea = torch.nn.functional.normalize(fea, p=2)
 
@@ -443,13 +456,13 @@ def evaluate(known_data_loader, val_data_loader, aux_data_loader, unknown_data_l
                 target_list = targets_temp
             else:
                 target_list = np.concatenate((target_list, targets_temp))
-            re_loss = torch.Tensor.cpu(re_loss).detach().numpy()
+            # re_loss = torch.Tensor.cpu(re_loss).detach().numpy()
             # print(re_loss)
             # if k_re_list is None:
             #     k_re_list = re_loss
             # else:
             #     k_re_list = np.concatenate((k_re_list, re_loss))
-            k_re_list.append(re_loss)
+            # k_re_list.append(re_loss)
             max_prob, _ = torch.max(torch.nn.functional.softmax(pred,dim=0),1)
             max_prob = torch.Tensor.cpu(max_prob).detach().numpy()
             if k_max_prob is None:
@@ -465,7 +478,8 @@ def evaluate(known_data_loader, val_data_loader, aux_data_loader, unknown_data_l
             # compute output
             with torch.cuda.amp.autocast():
                 # fea = model.module.forward_features(images)
-                re_loss, pred, fea, rec = model(images)
+                fea = model.forward_features(images)
+                # re_loss, pred, fea, rec = model(images)
                 # fea = model.module.encoder.forward_features(images)
                 # fea = torch.nn.functional.normalize(fea, p=2)
 
@@ -473,12 +487,12 @@ def evaluate(known_data_loader, val_data_loader, aux_data_loader, unknown_data_l
             fea_list = np.vstack((fea_list,feas))
             targets_temp = torch.Tensor.cpu(targets).detach().numpy() + args.num_train_classes
             target_list = np.concatenate((target_list, targets_temp))
-            re_loss = torch.Tensor.cpu(re_loss).numpy()
+            # re_loss = torch.Tensor.cpu(re_loss).numpy()
             # if u_re_list is None:
             #     u_re_list = re_loss
             # else:
             #     u_re_list = np.concatenate((u_re_list, re_loss))
-            u_re_list.append(re_loss)
+            # u_re_list.append(re_loss)
             max_prob, _ = torch.max(torch.nn.functional.softmax(pred,dim=0),1)
             max_prob = torch.Tensor.cpu(max_prob).detach().numpy()
             if u_max_prob is None:
@@ -495,7 +509,8 @@ def evaluate(known_data_loader, val_data_loader, aux_data_loader, unknown_data_l
             # compute output
             with torch.cuda.amp.autocast():
                 # fea = model.module.forward_features(images)
-                re_loss, pred, fea, rec = model(images)
+                fea = model.forward_features(images)
+                # re_loss, pred, fea, rec = model(images)
                 # fea = model.module.encoder.forward_features(images)
                 # fea = torch.nn.functional.normalize(fea, p=2)
 
@@ -503,9 +518,9 @@ def evaluate(known_data_loader, val_data_loader, aux_data_loader, unknown_data_l
             fea_list = np.vstack((fea_list,feas))
             targets_temp = torch.Tensor.cpu(targets).detach().numpy() + args.num_train_classes + args.num_aux_classes
             target_list = np.concatenate((target_list, targets_temp))
-            re_loss = torch.Tensor.cpu(re_loss).detach().numpy()
+            # re_loss = torch.Tensor.cpu(re_loss).detach().numpy()
             # u_re_list = np.concatenate((u_re_list, re_loss))
-            u_re_list.append(re_loss)
+            # u_re_list.append(re_loss)
             max_prob, _ = torch.max(torch.nn.functional.softmax(pred,dim=0),1)
             max_prob = torch.Tensor.cpu(max_prob).detach().numpy()
             u_max_prob = np.concatenate((u_max_prob, max_prob))
@@ -544,24 +559,24 @@ def evaluate(known_data_loader, val_data_loader, aux_data_loader, unknown_data_l
         plt.scatter(twodim_fea[:, 0].tolist(), twodim_fea[:, 1].tolist(), s=2, c=color_list)
         logger.add_figure("Fea_vis/fea_vis_known_unknown", fig, epoch)
 
-        fig = plt.figure()
-        plt.hist(k_re_list, bins=20)
+        # fig = plt.figure()
+        # plt.hist(k_re_list, bins=20)
+        # # plt.hist(u_re_list, bins=20)
+        # # plt.legend(["Known", "Unknown"])
+        # logger.add_figure("Re_loss/Known_re_loss_plot", fig, epoch)
+        #
+        # fig = plt.figure()
+        # # plt.hist(k_re_list, bins=20)
+        # plt.hist(u_re_list, bins=20)
+        # # plt.legend(["Known", "Unknown"])
+        # logger.add_figure("Re_loss/Unknown_re_loss_plot", fig, epoch)
+        #
+        #
+        # fig = plt.figure()
+        # plt.hist(k_re_list, bins=20)
         # plt.hist(u_re_list, bins=20)
         # plt.legend(["Known", "Unknown"])
-        logger.add_figure("Re_loss/Known_re_loss_plot", fig, epoch)
-
-        fig = plt.figure()
-        # plt.hist(k_re_list, bins=20)
-        plt.hist(u_re_list, bins=20)
-        # plt.legend(["Known", "Unknown"])
-        logger.add_figure("Re_loss/Unknown_re_loss_plot", fig, epoch)
-
-
-        fig = plt.figure()
-        plt.hist(k_re_list, bins=20)
-        plt.hist(u_re_list, bins=20)
-        plt.legend(["Known", "Unknown"])
-        logger.add_figure("Re_loss/re_loss_plot", fig, epoch)
+        # logger.add_figure("Re_loss/re_loss_plot", fig, epoch)
 
         fig = plt.figure()
         plt.hist(k_max_prob, bins=20)
@@ -677,3 +692,82 @@ def evaluate_byol(data_loader, model, device, epoch, logger=None, name="Val", re
         return cls_acc
     else:
         return None
+
+
+def vis_attention(model, args, test_folder="./vis_images", output_dir="./vis_attention", epoch=0):
+    epoch = "{:03d}".format(epoch)
+    model.eval()
+    for image_name in os.listdir(test_folder):
+        image_path = os.path.join(test_folder, image_name)
+        with open(image_path, 'rb') as f:
+            img = Image.open(f)
+            img = img.convert('RGB')
+        transform = transforms.Compose([
+            transforms.Resize(224),
+            transforms.ToTensor(),
+            transforms.Normalize((0.485, 0.456, 0.406), (0.229, 0.224, 0.225)),
+        ])
+        img = transform(img)
+
+        w, h = img.shape[1] - img.shape[1] % args.patch_size, img.shape[2] - img.shape[2] % args.patch_size
+        img = img[:, :w, :h].unsqueeze(0)
+
+        w_featmap = img.shape[-2] // args.patch_size
+        h_featmap = img.shape[-1] // args.patch_size
+
+        attentions = model.get_last_selfattention(img.cuda())
+
+        nh = attentions.shape[1]  # number of head
+
+        # we keep only the output patch attention
+        attentions = attentions[0, :, 0, 1:].reshape(nh, -1)
+        attentions = attentions.reshape(nh, w_featmap, h_featmap)
+        attentions = nn.functional.interpolate(attentions.unsqueeze(0), scale_factor=args.patch_size, mode="nearest")[
+            0].cpu().numpy()
+
+        for j in range(nh):
+            save_path = os.path.join(output_dir, image_name.split(".")[0], str(j))
+            os.makedirs(save_path, exist_ok=True)
+            fname = os.path.join(save_path, "attn-head" + str(j)  + "_" + str(epoch) + ".png")
+            plt.imsave(fname=fname, arr=attentions[j], format='png')
+            print(f"{fname} saved.")
+
+# def vis_attention2(model, args, test_folder="./vis_images", output_dir="./vis_attention", epoch=0):
+#     epoch = "{:03d}".format(epoch)
+#     model.eval()
+#     target_layers =
+#     cam = GradCAM(model=model, target_layers=target_layers, use_cuda=args.use_cuda)
+#     for image_name in os.listdir(test_folder):
+#         image_path = os.path.join(test_folder, image_name)
+#         with open(image_path, 'rb') as f:
+#             img = Image.open(f)
+#             img = img.convert('RGB')
+#         transform = transforms.Compose([
+#             transforms.Resize(224),
+#             transforms.ToTensor(),
+#             transforms.Normalize((0.485, 0.456, 0.406), (0.229, 0.224, 0.225)),
+#         ])
+#         img = transform(img)
+#
+#         w, h = img.shape[1] - img.shape[1] % args.patch_size, img.shape[2] - img.shape[2] % args.patch_size
+#         img = img[:, :w, :h].unsqueeze(0)
+#
+#         w_featmap = img.shape[-2] // args.patch_size
+#         h_featmap = img.shape[-1] // args.patch_size
+#
+#         attentions = model.get_last_selfattention(img.cuda())
+#
+#         nh = attentions.shape[1]  # number of head
+#
+#         # we keep only the output patch attention
+#         attentions = attentions[0, :, 0, 1:].reshape(nh, -1)
+#         attentions = attentions.reshape(nh, w_featmap, h_featmap)
+#         attentions = nn.functional.interpolate(attentions.unsqueeze(0), scale_factor=args.patch_size, mode="nearest")[
+#             0].cpu().numpy()
+#
+#         for j in range(nh):
+#             save_path = os.path.join(output_dir, image_name.split(".")[0], str(j))
+#             os.makedirs(save_path, exist_ok=True)
+#             fname = os.path.join(save_path, "attn-head" + str(j)  + "_" + str(epoch) + ".png")
+#             plt.imsave(fname=fname, arr=attentions[j], format='png')
+#             print(f"{fname} saved.")

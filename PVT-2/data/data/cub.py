@@ -178,7 +178,8 @@ def get_cub_datasets(train_transform, test_transform, num_train_classes=100, num
     np.random.shuffle(random_sequence)
     train_classes = random_sequence[:num_train_classes]
     auxiliary_classes = random_sequence[num_train_classes:(num_train_classes+num_auxiliary_classes)]
-    open_set_classes = random_sequence[(num_train_classes+num_auxiliary_classes):(num_train_classes+num_auxiliary_classes+num_open_set_classes)]
+    open_set_classes = random_sequence[(num_train_classes+num_auxiliary_classes):(
+            num_train_classes+num_auxiliary_classes+num_open_set_classes)]
 
     # Init train dataset and subsample training classes
     train_dataset_whole = CustomCub2011(root=cub_root, transform=train_transform, train=True)

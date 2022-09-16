@@ -21,12 +21,14 @@ from timm.optim import create_optimizer
 from timm.utils import NativeScaler, get_state_dict, ModelEma
 
 from tqdm import tqdm
-
+from pytorch_grad_cam import GradCAM
 from tensorboardX import SummaryWriter
 import logging
 from data.data.cub import CustomCub2011, get_cub_datasets
+from data.data.nabird import CustomNABirdV1, get_nabird_datasets
 from data.data.stanford_cars import CarsDataset, get_scar_datasets
 from data.data.cifar import get_cifar10_datasets, get_cifar100_datasets
+from data.data.nabird import get_nabird_datasets
 from data.data.tinyimagenet import get_tiny_image_net_datasets
 from data.utils import TransformTwice, RandomTranslateWithReflect
 import torchvision.transforms as transforms
@@ -36,23 +38,24 @@ from engine import train_one_epoch, update_means, evaluate
 from losses import DistillationLoss
 from samplers import RASampler
 # import models
-import pvt
-import pvt_v2
+# import pvt
+# import pvt_v2
+import vision_transformer as vits
 import utils
 import collections
-from vits import vit_small_single
+# from vits import vit_small_single
 # from timm.models.vision_transformer import VisionTransformer, _cfg
 import pickle
 
 from dec import DEC
-from model_aevit import ae_vit_base_patch16_dec512d8b as ae_vit_base
+# from model_aevit import ae_vit_base_patch16_dec512d8b as ae_vit_base
 
 
 def get_args_parser():
     parser = argparse.ArgumentParser('PVT training and evaluation script', add_help=False)
     parser.add_argument('--fp32-resume', action='store_true', default=False)
     parser.add_argument('--batch-size', default=8, type=int)
-    parser.add_argument('--epochs', default=500, type=int)
+    parser.add_argument('--epochs', default=200, type=int)
     parser.add_argument('--config', required=True, type=str, help='config')
     parser.add_argument('--num_train_classes', default=100, type=int)
     parser.add_argument('--num_aux_classes', default=50, type=int)
@@ -89,6 +92,7 @@ def get_args_parser():
                         help='weight decay (default: 0.05)')
     parser.add_argument('--wclu', type=float, default=1)
     parser.add_argument('--wce', type=float, default=1)
+    parser.add_argument('--patch_size', type=int, default=16)
 
     # Learning rate schedule parameters
     parser.add_argument('--sched', default='cosine', type=str, metavar='SCHEDULER',
@@ -170,7 +174,7 @@ def get_args_parser():
     # Dataset parameters
     parser.add_argument('--data-path', default='/datasets01/imagenet_full_size/061417/', type=str,
                         help='dataset path')
-    parser.add_argument('--dataset', default='CUB', choices=['CIFAR10', 'CIFAR100', 'TIMNT', 'IMNET', 'INAT', 'INAT19', 'CUB', 'SCAR'],
+    parser.add_argument('--dataset', default='CUB', choices=['CIFAR10', 'CIFAR100', 'TIMNT', 'IMNET', 'INAT', 'INAT19', 'CUB', 'SCAR', 'NABird'],
                         type=str, help='dataset path')
     parser.add_argument('--use-mcloader', action='store_true', default=False, help='Use mcloader')
     parser.add_argument('--inat-category', default='name',
@@ -214,9 +218,9 @@ def main(args):
     device = torch.device(args.device)
 
     # fix the seed for reproducibility
-    seed = args.seed + utils.get_rank()
-    torch.manual_seed(seed)
-    np.random.seed(seed)
+    # seed = args.seed + utils.get_rank()
+    # torch.manual_seed(seed)
+    np.random.seed(args.seed)
     # random.seed(seed)
 
     cudnn.benchmark = True
@@ -226,18 +230,29 @@ def main(args):
         RandomTranslateWithReflect(4),
         transforms.RandomHorizontalFlip(),
         transforms.ToTensor(),
-        # transforms.Normalize((0.4914, 0.4822, 0.4465), (0.2023, 0.1994, 0.2010)),
+        transforms.Normalize((0.4914, 0.4822, 0.4465), (0.2023, 0.1994, 0.2010)),
     ])
     test_transform = transforms.Compose([
         transforms.Resize((args.input_size, args.input_size)),
         transforms.ToTensor(),
-        # transforms.Normalize((0.4914, 0.4822, 0.4465), (0.2023, 0.1994, 0.2010)),
+        transforms.Normalize((0.4914, 0.4822, 0.4465), (0.2023, 0.1994, 0.2010)),
     ])
     if args.dataset == 'CUB':
         args.nb_classes = 100
         args.input_size = 224
         datasets = get_cub_datasets(train_transform, test_transform, seed=args.seed, num_train_classes=args.num_train_classes,
                                     num_auxiliary_classes=args.num_aux_classes, num_open_set_classes=args.num_test_classes)
+    elif args.dataset == 'NABird':
+        args.nb_classes = 304
+        args.input_size = 224
+        if args.num_train_classes is not None:
+            datasets = get_nabird_datasets(train_transform, test_transform, seed=args.seed,
+                                           num_train_classes=args.num_train_classes,
+                                           num_auxiliary_classes=args.num_aux_classes,
+                                           num_open_set_classes=args.num_test_classes)
+            args.nb_classes = args.num_train_classes
+        else:
+            datasets = get_nabird_datasets(train_transform.test_transform, seed=args.seed)
     elif args.dataset == 'SCAR':
         args.nb_classes = 98
         args.input_size = 224
@@ -298,19 +313,20 @@ def main(args):
 
     print(f"Creating model: {args.model}")
     # print(timm.list_models())
-    # model = create_model(
-    #     args.model,
-    #     pretrained=False,
-    #     # pretrained=True,
-    #     num_classes=args.nb_classes,
-    #     drop_rate=args.drop,
-    #     drop_path_rate=args.drop_path,
-    #     drop_block_rate=None,
-    # )
+    model = create_model(
+        args.model,
+        # pretrained=False,
+        pretrained=True,
+        num_classes=args.nb_classes,
+        # num_classes=0,
+        drop_rate=args.drop,
+        drop_path_rate=args.drop_path,
+        drop_block_rate=None,
+        )
 
     # model = DEC(args.num_train_classes, 768, model, 1.0)
 
-    model = ae_vit_base()
+    # model = ae_vit_base()
     # model.load_pretrained(
     #     "B_16-i21k-300ep-lr_0.001-aug_medium1-wd_0.1-do_0.0-sd_0.0--imagenet2012-steps_20k-lr_0.01-res_224.npz")
 
@@ -330,10 +346,10 @@ def main(args):
         else:
             checkpoint_model = checkpoint
         state_dict = model.state_dict()
-        # for k in ['head.weight', 'head.bias', 'head_dist.weight', 'head_dist.bias']:
-        #     if k in checkpoint_model and checkpoint_model[k].shape != state_dict[k].shape:
-        #         print(f"Removing key {k} from pretrained checkpoint")
-        #         del checkpoint_model[k]
+        for k in ['head.weight', 'head.bias', 'head_dist.weight', 'head_dist.bias']:
+            if k in checkpoint_model and checkpoint_model[k].shape != state_dict[k].shape:
+                print(f"Removing key {k} from pretrained checkpoint")
+                del checkpoint_model[k]
 
         # for BYOL and SimSiam
         # for k in list(checkpoint_model.keys()):
@@ -343,11 +359,13 @@ def main(args):
         #
         # for DINO
         # print(checkpoint_model.keys())
-        # checkpoint_model = checkpoint_model['teacher']
-        # for k in list(checkpoint_model.keys()):
-        #     if k.startswith("backbone."):
-        #         checkpoint_model[k.replace("backbone.","")] = checkpoint_model[k]
-        #         del checkpoint_model[k]
+        # if "checkpoint" in args.finetune:
+        if "teacher" in list(checkpoint_model.keys()):
+            checkpoint_model = checkpoint_model['teacher']
+            for k in list(checkpoint_model.keys()):
+                if k.startswith("backbone."):
+                    checkpoint_model[k.replace("backbone.","")] = checkpoint_model[k]
+                    del checkpoint_model[k]
 
         # checkpoint_model = checkpoint_model['student']
         # for k in list(checkpoint_model.keys()):
@@ -355,8 +373,18 @@ def main(args):
         #         checkpoint_model[k.replace("module.backbone.", "")] = checkpoint_model[k]
         #         del checkpoint_model[k]
 
-        #
+        # for MOCO_V3
+        # checkpoint_model = checkpoint_model['state_dict']
+        # # print(checkpoint_model.keys())
+        # for k in list(checkpoint_model.keys()):
+        #     # if k.startswith("module.base_encoder."):
+        #     if k.startswith("module.encoder_q."):
+        #         # checkpoint_model[k.replace("module.base_encoder.", "")] = checkpoint_model[k]
+        #         checkpoint_model[k.replace("module.encoder_q.", "")] = checkpoint_model[k]
+        #         del checkpoint_model[k]
+        # print(checkpoint_model.keys())
         for k in list(checkpoint_model.keys()):
+
             if k in list(state_dict.keys()):
                 print(k)
         model.load_state_dict(checkpoint_model, strict=False)
@@ -427,14 +455,20 @@ def main(args):
                 loss_scaler.load_state_dict(checkpoint['scaler'])
 
     if args.eval:
-
+        # model.module.reset_classifier(0)
         model.eval()
+        cam = GradCAM(model=model, target_layers=[model.blocks[-1].norm1], use_cuda=True)
+
+
         print("Start evaluation")
         open("{}/tk_result.txt".format(args.output_dir),"w").close()
+        open("{}/tk_fea.txt".format(args.output_dir), "w").close()
         open("{}/tk_target.txt".format(args.output_dir),"w").close()
         open("{}/tu_result.txt".format(args.output_dir), "w").close()
+        open("{}/tu_fea.txt".format(args.output_dir), "w").close()
         open("{}/tu_target.txt".format(args.output_dir), "w").close()
         open("{}/aux_result.txt".format(args.output_dir), "w").close()
+        open("{}/aux_fea.txt".format(args.output_dir), "w").close()
         open("{}/aux_target.txt".format(args.output_dir), "w").close()
 
         for batch_idx, (images, target) in enumerate(tqdm(test_known_loader)):
@@ -442,25 +476,36 @@ def main(args):
             target = target.to(device, non_blocking=True)
             target = torch.Tensor.cpu(target).detach().numpy()
             with torch.cuda.amp.autocast():
-                # output = model(images)
-                output = model.module.forward_features(images)
+                output = model(images)
+                fea = model.module.forward_features(images)
                 output = torch.Tensor.cpu(output).detach().numpy()
+                fea = torch.Tensor.cpu(fea).detach().numpy()
+                # print(output.shape)
             with open('{}/tk_result.txt'.format(args.output_dir), 'ab') as f:
                 np.savetxt(f, output, fmt='%f', delimiter=' ', newline='\r')
+                f.write(b'\n')
+            with open('{}/tk_fea.txt'.format(args.output_dir), 'ab') as f:
+                np.savetxt(f, fea, fmt='%f', delimiter=' ', newline='\r')
                 f.write(b'\n')
             with open('{}/tk_target.txt'.format(args.output_dir), 'ab') as f:
                 np.savetxt(f, target, fmt='%f', delimiter=' ', newline='\r')
                 f.write(b'\n')
+
+
         for batch_idx, (images, target) in enumerate(tqdm(test_unknown_loader)):
             images = images.to(device, non_blocking=True)
             target = target.to(device, non_blocking=True)
             target = torch.Tensor.cpu(target).detach().numpy()
             with torch.cuda.amp.autocast():
-                # output = model(images)
-                output = model.module.forward_features(images)
+                output = model(images)
+                fea = model.module.forward_features(images)
                 output = torch.Tensor.cpu(output).detach().numpy()
+                fea = torch.Tensor.cpu(fea).detach().numpy()
             with open('{}/tu_result.txt'.format(args.output_dir), 'ab') as f:
                 np.savetxt(f, output, fmt='%f', delimiter=' ', newline='\r')
+                f.write(b'\n')
+            with open('{}/tu_fea.txt'.format(args.output_dir), 'ab') as f:
+                np.savetxt(f, fea, fmt='%f', delimiter=' ', newline='\r')
                 f.write(b'\n')
             with open('{}/tu_target.txt'.format(args.output_dir), 'ab') as f:
                 np.savetxt(f, target, fmt='%f', delimiter=' ', newline='\r')
@@ -470,11 +515,15 @@ def main(args):
             target = target.to(device, non_blocking=True)
             target = torch.Tensor.cpu(target).detach().numpy()
             with torch.cuda.amp.autocast():
-                # output = model(images)
-                output = model.module.forward_features(images)
+                output = model(images)
+                fea = model.module.forward_features(images)
                 output = torch.Tensor.cpu(output).detach().numpy()
+                fea = torch.Tensor.cpu(fea).detach().numpy()
             with open('{}/aux_result.txt'.format(args.output_dir), 'ab') as f:
                 np.savetxt(f, output, fmt='%f', delimiter=' ', newline='\r')
+                f.write(b'\n')
+            with open('{}/aux_fea.txt'.format(args.output_dir), 'ab') as f:
+                np.savetxt(f, fea, fmt='%f', delimiter=' ', newline='\r')
                 f.write(b'\n')
             with open('{}/aux_target.txt'.format(args.output_dir), 'ab') as f:
                 np.savetxt(f, target, fmt='%f', delimiter=' ', newline='\r')
@@ -487,7 +536,7 @@ def main(args):
     max_accuracy = 0.0
     best_val_loss = 99999999
 
-    means = update_means(model, data_loader_train, args=args, logger=logger, epoch=-1)
+    # means = update_means(model, data_loader_train, args=args, logger=logger, epoch=-1)
     means = None
     evaluate(test_known_loader, labeled_eval_loader, aux_test_loader, test_unknown_loader, model, device, -1, args,
              logger, means)
@@ -520,7 +569,7 @@ def main(args):
         lr_scheduler.step(epoch)
         # print("One epoch training done!")
 
-        means = update_means(model, data_loader_train, args=args, logger=logger, epoch=epoch)
+        # means = update_means(model, data_loader_train, args=args, logger=logger, epoch=epoch)
 
         val_loss  = evaluate(test_known_loader, labeled_eval_loader, aux_test_loader, test_unknown_loader, model, device, epoch, args, logger, means)
         # print("Evaluation finished!")
