@@ -313,16 +313,17 @@ def main(args):
 
     print(f"Creating model: {args.model}")
     # print(timm.list_models())
-    model = create_model(
-        args.model,
-        # pretrained=False,
-        pretrained=True,
-        num_classes=args.nb_classes,
-        # num_classes=0,
-        drop_rate=args.drop,
-        drop_path_rate=args.drop_path,
-        drop_block_rate=None,
-        )
+    # model = create_model(
+    #     args.model,
+    #     # pretrained=False,
+    #     pretrained=True,
+    #     num_classes=args.nb_classes,
+    #     # num_classes=0,
+    #     drop_rate=args.drop,
+    #     drop_path_rate=args.drop_path,
+    #     drop_block_rate=None,
+    #     )
+    model = vits.__dict__[args.arch](patch_size=args.patch_size)
 
     # model = DEC(args.num_train_classes, 768, model, 1.0)
 
